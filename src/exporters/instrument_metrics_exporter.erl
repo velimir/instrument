@@ -260,7 +260,7 @@ do_export(#state{exporters = Exporters} = State) ->
 collect_metrics() ->
   %% First, invoke all observable callbacks to update their values
   instrument_meter:collect_observables(),
-  RawMetrics = instrument_registry:collect_all(),
+  RawMetrics = instrument_otel_streams:group(instrument_registry:collect_all()),
   Timestamp = erlang:system_time(nanosecond),
   lists:filtermap(fun(Metric) ->
     case convert_metric(Metric, Timestamp) of
@@ -284,17 +284,17 @@ convert_metric(#{type := counter, name := Name, help := Help, val := Val} = Metr
     }]
   };
 
-convert_metric(#{type := counter, name := Name, help := Help, labels := Labels, data := Data}, Timestamp) ->
+convert_metric(#{type := counter, name := Name, help := Help, labels := _Labels, data := Data}, Timestamp) ->
   #{
     name => to_binary(Name),
     description => extract_help(Help),
     unit => get_instrument_unit(Name),
     type => counter,
     data_points => [#{
-      attributes => make_attributes(Labels, LabelVals),
+      attributes => make_attributes(RowNames, LabelVals),
       value => Val,
       timestamp => Timestamp
-    } || {_, LabelVals, Val} <- Data]
+    } || {RowNames, LabelVals, Val} <- Data]
   };
 
 convert_metric(#{type := gauge, name := Name, help := Help, val := Val}, Timestamp) ->
@@ -310,17 +310,17 @@ convert_metric(#{type := gauge, name := Name, help := Help, val := Val}, Timesta
     }]
   };
 
-convert_metric(#{type := gauge, name := Name, help := Help, labels := Labels, data := Data}, Timestamp) ->
+convert_metric(#{type := gauge, name := Name, help := Help, labels := _Labels, data := Data}, Timestamp) ->
   #{
     name => to_binary(Name),
     description => extract_help(Help),
     unit => get_instrument_unit(Name),
     type => gauge,
     data_points => [#{
-      attributes => make_attributes(Labels, LabelVals),
+      attributes => make_attributes(RowNames, LabelVals),
       value => Val,
       timestamp => Timestamp
-    } || {_, LabelVals, Val} <- Data]
+    } || {RowNames, LabelVals, Val} <- Data]
   };
 
 convert_metric(#{type := histogram, name := Name, help := Help, count := Count, sum := Sum, buckets := Buckets} = Metric, Timestamp) ->
@@ -342,14 +342,14 @@ convert_metric(#{type := histogram, name := Name, help := Help, count := Count, 
     }]
   };
 
-convert_metric(#{type := histogram, name := Name, help := Help, labels := Labels, data := Data}, Timestamp) ->
+convert_metric(#{type := histogram, name := Name, help := Help, labels := _Labels, data := Data}, Timestamp) ->
   #{
     name => to_binary(Name),
     description => extract_help(Help),
     unit => get_instrument_unit(Name),
     type => histogram,
     data_points => [#{
-      attributes => make_attributes(Labels, LabelVals),
+      attributes => make_attributes(RowNames, LabelVals),
       value => #{
         count => maps:get(count, Val),
         sum => maps:get(sum, Val),
@@ -357,7 +357,7 @@ convert_metric(#{type := histogram, name := Name, help := Help, labels := Labels
                     || B <- maps:get(buckets, Val)]
       },
       timestamp => Timestamp
-    } || {_, LabelVals, Val} <- Data]
+    } || {RowNames, LabelVals, Val} <- Data]
   };
 
 convert_metric(_, _) ->

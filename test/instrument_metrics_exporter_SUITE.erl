@@ -43,7 +43,9 @@
   %% OTLP temporality test (OTel spec compliance)
   otlp_temporality_export_test/1,
   %% Console exporter file output (regression for io_device unwrap bug)
-  console_exporter_file_output_test/1
+  console_exporter_file_output_test/1,
+  %% OTel attributed writes collapse into a single stream
+  otel_attributed_single_stream_test/1
 ]).
 
 -include_lib("stdlib/include/assert.hrl").
@@ -79,7 +81,9 @@ all() ->
     %% OTLP temporality test (OTel spec compliance)
     otlp_temporality_export_test,
     %% Console exporter file output (regression for io_device unwrap bug)
-    console_exporter_file_output_test
+    console_exporter_file_output_test,
+    %% OTel attributed writes collapse into a single stream
+    otel_attributed_single_stream_test
   ].
 
 init_per_suite(Config) ->
@@ -654,4 +658,29 @@ console_exporter_file_output_test(_Config) ->
   ?assert(byte_size(Bin) > 0),
   ?assertNotEqual(nomatch, binary:match(Bin, <<"my_counter">>)),
   _ = file:delete(Path),
+  ok.
+
+otel_attributed_single_stream_test(_Config) ->
+  _ = instrument_meter:unregister_all_instruments(),
+  Meter = instrument_meter:get_meter(<<"single_stream">>),
+  C = instrument_meter:create_counter(Meter, <<"sreq_total">>, #{}),
+  ok = instrument_meter:add(C, 1),                                   %% unlabeled
+  ok = instrument_meter:add(C, 2, #{method => <<"GET">>}),
+  ok = instrument_meter:add(C, 3, #{method => <<"GET">>, status => 200}),
+
+  Metrics = instrument_metrics_exporter:collect(),
+
+  %% Exactly one stream, named as registered; no derived name.
+  Named = [M || #{name := N} = M <- Metrics, N =:= <<"sreq_total">>],
+  ?assertEqual(1, length(Named)),
+  ?assertEqual([], [M || #{name := N} = M <- Metrics,
+                         binary:match(N, <<"sreq_total_">>) =/= nomatch]),
+
+  [#{data_points := DPs}] = Named,
+  AllAttrs = [maps:get(attributes, DP) || DP <- DPs],
+  %% includes the {} from the unlabeled add and the two attributed sets
+  ?assert(lists:member(#{}, AllAttrs)),
+  ?assert(lists:any(fun(A) -> maps:get(<<"method">>, A, undefined) =:= <<"GET">>
+                              andalso maps:get(<<"status">>, A, undefined) =:= <<"200">>
+                    end, AllAttrs)),
   ok.
