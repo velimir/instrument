@@ -39,7 +39,8 @@
   temporality_option_delta_test/1,
   temporality_default_test/1,
   add_negative_to_labeled_up_down_counter/1,
-  lazy_base_registration_test/1
+  lazy_base_registration_test/1,
+  otel_name_index_test/1
 ]).
 
 -include("instrument_otel.hrl").
@@ -71,7 +72,8 @@ all() ->
     temporality_option_delta_test,
     temporality_default_test,
     add_negative_to_labeled_up_down_counter,
-    lazy_base_registration_test
+    lazy_base_registration_test,
+    otel_name_index_test
   ].
 
 init_per_suite(Config) ->
@@ -598,4 +600,24 @@ lazy_base_registration_test(_Config) ->
   _ = instrument_meter:create_counter(Meter, <<"never_written">>),
   ?assertEqual(undefined,
                instrument_registry:lookup({otel, <<"never_written">>})),
+  ok.
+
+otel_name_index_test(_Config) ->
+  Meter = instrument_meter:get_meter(<<"idx_test">>),
+  C = instrument_meter:create_counter(Meter, <<"idx_counter">>),
+  ok = instrument_meter:add(C, 1, #{method => <<"GET">>, status => 200}),
+  ok = instrument_meter:add(C, 1),
+
+  Index = instrument_meter:otel_name_index(),
+
+  %% The base (registered on the unlabeled add) maps to the user name.
+  ?assertEqual(<<"idx_counter">>,
+               maps:get({otel, <<"idx_counter">>}, Index)),
+
+  %% Every tracked vec maps to the same user name.
+  VecNames = persistent_term:get({otel_instrument_vecs, {otel, <<"idx_counter">>}}, []),
+  ?assert(length(VecNames) >= 1),
+  lists:foreach(fun(V) ->
+    ?assertEqual(<<"idx_counter">>, maps:get(V, Index))
+  end, VecNames),
   ok.

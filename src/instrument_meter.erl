@@ -59,7 +59,8 @@
   list_instruments/0,
   collect_observables/0,
   unregister_instrument/1,
-  unregister_all_instruments/0
+  unregister_all_instruments/0,
+  otel_name_index/0
 ]).
 
 -include("instrument.hrl").
@@ -326,6 +327,28 @@ unregister_instrument(Name) when is_binary(Name) ->
 get_internal_metric_name(#metric{name = MetricName}) -> MetricName;
 get_internal_metric_name({observable, #metric{name = MetricName}, _}) -> MetricName;
 get_internal_metric_name(_) -> undefined.
+
+%% @doc Map every registered OTel metric name (the base `{otel, Name}` /
+%% bare-binary histogram name, and each tracked `{otel_vec, _}` / bare vec
+%% name) to its user-facing instrument name. Used by the export grouping
+%% step to fold an instrument's base + vecs into one stream.
+-spec otel_name_index() -> #{term() => binary()}.
+otel_name_index() ->
+  Names = persistent_term:get(otel_instruments, []),
+  lists:foldl(fun(Name, Acc) ->
+    case get_instrument(Name) of
+      undefined ->
+        Acc;
+      #otel_instrument{handle = Handle} ->
+        Base = get_internal_metric_name(Handle),
+        VecNames = persistent_term:get({otel_instrument_vecs, Base}, []),
+        Acc1 = case Base of
+                 undefined -> Acc;
+                 _ -> Acc#{Base => Name}
+               end,
+        lists:foldl(fun(V, A) -> A#{V => Name} end, Acc1, VecNames)
+    end
+  end, #{}, Names).
 
 %% Unregister all vec metrics associated with an OTel instrument
 unregister_associated_vec_metrics(undefined) -> ok;
