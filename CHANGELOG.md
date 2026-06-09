@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Meter attributed writes (`add/3`, `record/3`, `set/3`, and attributed
+  observable callbacks) now export under the **registered instrument name**
+  with the attributes as data-point attributes, instead of under a
+  label-derived name (`<name>_<labels>` for counters/gauges, `<name>_vec_<labels>`
+  for histograms). The data was previously unreachable by the documented name.
+- The registered instrument no longer appears as a constant-zero, no-attributes
+  series when it is only ever written with attributes. The base instrument is
+  now registered lazily on its first unlabeled write.
+
+### Changed
+- An instrument that is created but never written is no longer exported as a
+  zero series; it appears on its first write (matching the OpenTelemetry SDKs).
+- In the Prometheus exposition, when one instrument is written with different
+  attribute key-sets, the metric family's label columns are the union across
+  those key-sets, with empty-string values for absent keys.
+
 ## [1.1.3] - 2026-05-28
 
 ### Fixed

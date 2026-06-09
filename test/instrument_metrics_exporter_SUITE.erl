@@ -45,7 +45,9 @@
   %% Console exporter file output (regression for io_device unwrap bug)
   console_exporter_file_output_test/1,
   %% OTel attributed writes collapse into a single stream
-  otel_attributed_single_stream_test/1
+  otel_attributed_single_stream_test/1,
+  %% Regression: no derived/mangled OTel series names
+  no_mangled_otel_series_test/1
 ]).
 
 -include_lib("stdlib/include/assert.hrl").
@@ -83,7 +85,9 @@ all() ->
     %% Console exporter file output (regression for io_device unwrap bug)
     console_exporter_file_output_test,
     %% OTel attributed writes collapse into a single stream
-    otel_attributed_single_stream_test
+    otel_attributed_single_stream_test,
+    %% Regression: no derived/mangled OTel series names
+    no_mangled_otel_series_test
   ].
 
 init_per_suite(Config) ->
@@ -412,27 +416,25 @@ metric_name_otel_test(_Config) ->
   nomatch = binary:match(Name, <<"{otel">>),
   ok.
 
-%% Test that OTel meter metrics with attributes have correct names
+%% Test that OTel meter metrics with attributes export as one stream under
+%% the registered name (no derived `_<labels>` series).
 metric_name_otel_with_attrs_test(_Config) ->
+  _ = instrument_meter:unregister_all_instruments(),
   Meter = instrument_meter:get_meter(<<"attr_service">>),
   Counter = instrument_meter:create_counter(Meter, <<"otel_attr_counter">>, #{
     description => <<"OTel counter with attributes">>
   }),
-
-  %% Add with different attribute sets
   ok = instrument_meter:add(Counter, 1, #{method => <<"GET">>}),
   ok = instrument_meter:add(Counter, 2, #{method => <<"POST">>}),
   ok = instrument_meter:add(Counter, 3, #{method => <<"GET">>, status => 200}),
 
   Metrics = instrument_metrics_exporter:collect(),
 
-  %% The vec metrics created for attributes should have distinct names
-  %% Find all metrics related to otel_attr_counter
-  AttrMetrics = [M || #{name := N} = M <- Metrics,
-                      binary:match(N, <<"otel_attr_counter">>) =/= nomatch],
-
-  %% Should have created metrics for the different attribute schemas
-  true = length(AttrMetrics) >= 1,
+  %% Exactly one stream, named as registered; no derived `_method`/`_method_status` names.
+  Named = [M || #{name := N} = M <- Metrics, N =:= <<"otel_attr_counter">>],
+  ?assertEqual(1, length(Named)),
+  ?assertEqual([], [M || #{name := N} = M <- Metrics,
+                         binary:match(N, <<"otel_attr_counter_">>) =/= nomatch]),
   ok.
 
 %% ============================================================================
@@ -482,6 +484,7 @@ metric_attrs_vec_labels_test(_Config) ->
 
 %% Test OTel metrics with single attribute
 metric_attrs_otel_single_test(_Config) ->
+  _ = instrument_meter:unregister_all_instruments(),
   Meter = instrument_meter:get_meter(<<"single_attr_svc">>),
   Gauge = instrument_meter:create_gauge(Meter, <<"otel_single_attr_gauge">>, #{}),
 
@@ -490,22 +493,21 @@ metric_attrs_otel_single_test(_Config) ->
 
   Metrics = instrument_metrics_exporter:collect(),
 
-  %% Find the vec metric created for attributes
-  GaugeMetrics = [M || #{name := N} = M <- Metrics,
-                       binary:match(N, <<"otel_single_attr_gauge">>) =/= nomatch],
-  true = length(GaugeMetrics) >= 1,
+  %% One stream under the registered name; no derived name.
+  Named = [M || #{name := N} = M <- Metrics, N =:= <<"otel_single_attr_gauge">>],
+  ?assertEqual(1, length(Named)),
+  ?assertEqual([], [M || #{name := N} = M <- Metrics,
+                         binary:match(N, <<"otel_single_attr_gauge_">>) =/= nomatch]),
 
-  %% Get data points and verify attributes (check ALL matching metrics, not just first)
-  AllDataPoints = lists:flatmap(fun(#{data_points := DPs}) -> DPs end, GaugeMetrics),
-  AllAttrs = [maps:get(attributes, DP) || DP <- AllDataPoints],
-
-  %% Should have host attribute
-  true = lists:any(fun(A) -> maps:get(<<"host">>, A, undefined) =:= <<"server1">> end, AllAttrs),
-  true = lists:any(fun(A) -> maps:get(<<"host">>, A, undefined) =:= <<"server2">> end, AllAttrs),
+  [#{data_points := DPs}] = Named,
+  AllAttrs = [maps:get(attributes, DP) || DP <- DPs],
+  ?assert(lists:any(fun(A) -> maps:get(<<"host">>, A, undefined) =:= <<"server1">> end, AllAttrs)),
+  ?assert(lists:any(fun(A) -> maps:get(<<"host">>, A, undefined) =:= <<"server2">> end, AllAttrs)),
   ok.
 
 %% Test OTel metrics with multiple attributes
 metric_attrs_otel_multiple_test(_Config) ->
+  _ = instrument_meter:unregister_all_instruments(),
   Meter = instrument_meter:get_meter(<<"multi_attr_svc">>),
   Histogram = instrument_meter:create_histogram(Meter, <<"otel_multi_attr_hist">>, #{
     boundaries => [0.1, 0.5, 1.0, 5.0]
@@ -516,17 +518,16 @@ metric_attrs_otel_multiple_test(_Config) ->
 
   Metrics = instrument_metrics_exporter:collect(),
 
-  %% Find histogram metrics
-  HistMetrics = [M || #{name := N} = M <- Metrics,
-                      binary:match(N, <<"otel_multi_attr_hist">>) =/= nomatch],
-  true = length(HistMetrics) >= 1,
+  %% One histogram stream under the registered name; no derived `_vec` name.
+  Named = [M || #{name := N} = M <- Metrics, N =:= <<"otel_multi_attr_hist">>],
+  ?assertEqual(1, length(Named)),
+  ?assertEqual([], [M || #{name := N} = M <- Metrics,
+                         binary:match(N, <<"otel_multi_attr_hist_vec">>) =/= nomatch]),
 
-  %% Verify attributes contain both keys (check ALL matching metrics, not just first)
-  AllDataPoints = lists:flatmap(fun(#{data_points := DPs}) -> DPs end, HistMetrics),
-  AllAttrs = [maps:get(attributes, DP) || DP <- AllDataPoints],
-
-  %% Should have method and endpoint attributes
-  true = lists:any(fun(A) -> maps:is_key(<<"method">>, A) orelse maps:is_key(<<"endpoint">>, A) end, AllAttrs),
+  [#{data_points := DPs}] = Named,
+  AllAttrs = [maps:get(attributes, DP) || DP <- DPs],
+  ?assert(lists:any(fun(A) -> maps:get(<<"method">>, A, undefined) =:= <<"GET">> end, AllAttrs)),
+  ?assert(lists:any(fun(A) -> maps:get(<<"endpoint">>, A, undefined) =:= <<"/api">> end, AllAttrs)),
   ok.
 
 %% Test attribute value type conversions
@@ -683,4 +684,22 @@ otel_attributed_single_stream_test(_Config) ->
   ?assert(lists:any(fun(A) -> maps:get(<<"method">>, A, undefined) =:= <<"GET">>
                               andalso maps:get(<<"status">>, A, undefined) =:= <<"200">>
                     end, AllAttrs)),
+  ok.
+
+no_mangled_otel_series_test(_Config) ->
+  _ = instrument_meter:unregister_all_instruments(),
+  M = instrument_meter:get_meter(<<"nomangle">>),
+  Ctr = instrument_meter:create_counter(M, <<"nm_counter">>, #{}),
+  ok = instrument_meter:add(Ctr, 1, #{method => <<"GET">>, status => 200}),
+  H = instrument_meter:create_histogram(M, <<"nm_latency">>, #{boundaries => [1, 5, 10]}),
+  ok = instrument_meter:record(H, 2.0, #{endpoint => <<"/a">>}),
+
+  Names = [N || #{name := N} <- instrument_metrics_exporter:collect()],
+
+  %% No counter/gauge style `<name>_<labels>` and no histogram `<name>_vec_<labels>`.
+  ?assertEqual([], [N || N <- Names, binary:match(N, <<"nm_counter_">>) =/= nomatch]),
+  ?assertEqual([], [N || N <- Names, binary:match(N, <<"nm_latency_vec">>) =/= nomatch]),
+  %% The registered names are present.
+  ?assert(lists:member(<<"nm_counter">>, Names)),
+  ?assert(lists:member(<<"nm_latency">>, Names)),
   ok.

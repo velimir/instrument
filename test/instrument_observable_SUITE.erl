@@ -365,17 +365,18 @@ observable_counter_renders_as_counter(_Config) ->
   ok = instrument_meter:collect_observables(),
   Output = instrument_prometheus:format(),
 
-  %% The labeled vec name carries the sorted-attrs suffix (`_region`).
-  %% format_counter adds `_total` on top of that.
+  %% The labeled observation renders under the registered instrument name
+  %% (attributes as labels), not a derived `_region` name. format_counter
+  %% adds the `_total` suffix.
   ?assertNotEqual(nomatch,
-                  binary:match(Output, <<"# TYPE obs_counter_labeled_region_total counter">>)),
+                  binary:match(Output, <<"# TYPE obs_counter_labeled_total counter">>)),
   ?assertNotEqual(nomatch,
                   binary:match(Output,
-                               <<"obs_counter_labeled_region_total{region=\"us-east\"} 7.0">>)),
+                               <<"obs_counter_labeled_total{region=\"us-east\"} 7.0">>)),
 
   %% Must NOT be misrendered as gauge.
   ?assertEqual(nomatch,
-               binary:match(Output, <<"# TYPE obs_counter_labeled_region gauge">>)),
+               binary:match(Output, <<"# TYPE obs_counter_labeled gauge">>)),
   ok.
 
 observable_counter_with_multiple_label_schemas(_Config) ->
@@ -393,16 +394,14 @@ observable_counter_with_multiple_label_schemas(_Config) ->
   ok = instrument_meter:collect_observables(),
   Output = instrument_prometheus:format(),
 
-  %% Each label-key schema produces its own vec (suffix derived from
-  %% sorted attribute keys).
+  %% Both label-key schemas fold into one stream under the registered name,
+  %% rendered as a counter. The label columns are the union (`a`, `b`) with
+  %% empty-string fill for the schema that lacks `b`.
   ?assertNotEqual(nomatch,
-                  binary:match(Output, <<"# TYPE obs_counter_multi_schema_a_total counter">>)),
+                  binary:match(Output, <<"# TYPE obs_counter_multi_schema_total counter">>)),
   ?assertNotEqual(nomatch,
-                  binary:match(Output, <<"obs_counter_multi_schema_a_total{a=\"x\"} 5.0">>)),
-
-  ?assertNotEqual(nomatch,
-                  binary:match(Output, <<"# TYPE obs_counter_multi_schema_a_b_total counter">>)),
+                  binary:match(Output, <<"obs_counter_multi_schema_total{a=\"x\",b=\"\"} 5.0">>)),
   ?assertNotEqual(nomatch,
                   binary:match(Output,
-                               <<"obs_counter_multi_schema_a_b_total{a=\"x\",b=\"y\"} 7.0">>)),
+                               <<"obs_counter_multi_schema_total{a=\"x\",b=\"y\"} 7.0">>)),
   ok.

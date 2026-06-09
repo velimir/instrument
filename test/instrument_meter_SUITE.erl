@@ -573,13 +573,13 @@ add_negative_to_labeled_up_down_counter(_Config) ->
   %% Rendered exposition must reflect 5 - 2 = 3.0 for {a="x"}.
   Output1 = instrument_prometheus:format(),
   ?assertNotEqual(nomatch,
-                  binary:match(Output1, <<"signed_active_a{a=\"x\"} 3.0">>)),
+                  binary:match(Output1, <<"signed_active{a=\"x\"} 3.0">>)),
 
   %% A negative-only label set must register and render as a negative gauge.
   ok = instrument_meter:add(Counter, -1, #{a => <<"y">>}),
   Output2 = instrument_prometheus:format(),
   ?assertNotEqual(nomatch,
-                  binary:match(Output2, <<"signed_active_a{a=\"y\"} -1.0">>)),
+                  binary:match(Output2, <<"signed_active{a=\"y\"} -1.0">>)),
   ok.
 
 lazy_base_registration_test(_Config) ->
