@@ -49,9 +49,17 @@ merge_group([First | _] = Ms) ->
   Union = lists:usort(lists:append([Names || {Names, _, _} <- Rows])),
   #{type => maps:get(type, First),
     name => maps:get(name, First),
-    help => maps:get(help, First, <<>>),
+    help => first_non_empty([maps:get(help, M, <<>>) || M <- Ms]),
     labels => Union,
     data => Rows}.
+
+%% Only the base entry carries the instrument's description; vec entries are
+%% created with empty help. collect_all/0 order is unspecified, so the base may
+%% not be first in the group. Pick the first non-empty help so the merged
+%% stream keeps the description regardless of order.
+first_non_empty([H | _]) when H =/= <<>> -> H;
+first_non_empty([_ | Rest]) -> first_non_empty(Rest);
+first_non_empty([]) -> <<>>.
 
 %% Normalize one raw entry into a list of {LabelNames, LabelValues, Value} rows.
 rows(#{data := Data}) ->

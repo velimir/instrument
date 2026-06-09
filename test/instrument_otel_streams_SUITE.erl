@@ -1,11 +1,13 @@
 -module(instrument_otel_streams_SUITE).
 -export([all/0]).
 -export([groups_base_and_vecs/1, renames_single_vec/1,
-         passes_through_single_base/1, passes_through_non_otel/1]).
+         passes_through_single_base/1, passes_through_non_otel/1,
+         merge_keeps_base_description/1]).
 -include_lib("stdlib/include/assert.hrl").
 
 all() -> [groups_base_and_vecs, renames_single_vec,
-          passes_through_single_base, passes_through_non_otel].
+          passes_through_single_base, passes_through_non_otel,
+          merge_keeps_base_description].
 
 %% base + two distinct key-set vecs for one instrument -> one merged stream
 groups_base_and_vecs(_Config) ->
@@ -52,4 +54,20 @@ passes_through_non_otel(_Config) ->
   Index = #{},
   Raw = [#{type => counter, name => <<"plain">>, help => <<"h">>, val => 7}],
   ?assertEqual(Raw, instrument_otel_streams:group(Raw, Index)),
+  ok.
+
+%% The instrument's description lives only on the base entry; vec entries carry
+%% empty help. collect_all/0 order is unspecified (sets:to_list), so a vec may
+%% precede the base. The merged stream must still carry the base description.
+merge_keeps_base_description(_Config) ->
+  Index = #{{otel, <<"d">>} => <<"d">>,
+           {otel_vec, <<"d_method">>} => <<"d">>},
+  %% Vec first (empty help), base second (the real description).
+  Raw = [
+    #{type => counter, name => {otel_vec, <<"d_method">>}, help => <<>>,
+      labels => [method], data => [{[method], [<<"GET">>], 2}]},
+    #{type => counter, name => {otel, <<"d">>}, help => <<"the description">>, val => 1}
+  ],
+  [Merged] = instrument_otel_streams:group(Raw, Index),
+  ?assertEqual(<<"the description">>, maps:get(help, Merged)),
   ok.
