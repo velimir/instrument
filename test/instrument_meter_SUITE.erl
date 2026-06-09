@@ -38,7 +38,8 @@
   temporality_option_cumulative_test/1,
   temporality_option_delta_test/1,
   temporality_default_test/1,
-  add_negative_to_labeled_up_down_counter/1
+  add_negative_to_labeled_up_down_counter/1,
+  lazy_base_registration_test/1
 ]).
 
 -include("instrument_otel.hrl").
@@ -69,7 +70,8 @@ all() ->
     temporality_option_cumulative_test,
     temporality_option_delta_test,
     temporality_default_test,
-    add_negative_to_labeled_up_down_counter
+    add_negative_to_labeled_up_down_counter,
+    lazy_base_registration_test
   ].
 
 init_per_suite(Config) ->
@@ -576,4 +578,24 @@ add_negative_to_labeled_up_down_counter(_Config) ->
   Output2 = instrument_prometheus:format(),
   ?assertNotEqual(nomatch,
                   binary:match(Output2, <<"signed_active_a{a=\"y\"} -1.0">>)),
+  ok.
+
+lazy_base_registration_test(_Config) ->
+  Meter = instrument_meter:get_meter(<<"lazy_test">>),
+  C = instrument_meter:create_counter(Meter, <<"lazy_counter">>),
+
+  %% Only attributed writes so far: the base must NOT be registered.
+  ok = instrument_meter:add(C, 1, #{method => <<"GET">>}),
+  ?assertEqual(undefined,
+               instrument_registry:lookup({otel, <<"lazy_counter">>})),
+
+  %% First unlabeled write registers the base.
+  ok = instrument_meter:add(C, 1),
+  ?assertNotEqual(undefined,
+                  instrument_registry:lookup({otel, <<"lazy_counter">>})),
+
+  %% An instrument created but never written stays unregistered.
+  _ = instrument_meter:create_counter(Meter, <<"never_written">>),
+  ?assertEqual(undefined,
+               instrument_registry:lookup({otel, <<"never_written">>})),
   ok.

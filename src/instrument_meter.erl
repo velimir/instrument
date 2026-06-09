@@ -419,26 +419,22 @@ create_underlying_metric(Name, counter, Opts) ->
   StartTime = erlang:system_time(nanosecond),
   Description = maps:get(description, Opts, <<>>),
   Info = instrument_lib:mk_info(Name, Description),
-  Metric = #metric{
+  #metric{
     name = {otel, Name},
     handle = {Ref, StartTime},
     collect = {instrument_counter, collect, [Info, {Ref, StartTime}]}
-  },
-  ok = instrument_metric:register(Metric),
-  Metric;
+  };
 
 create_underlying_metric(Name, up_down_counter, Opts) ->
   %% Use gauge NIF for up_down_counter
   {ok, Ref} = instrument_nif:new_gauge(),
   Description = maps:get(description, Opts, <<>>),
   Info = instrument_lib:mk_info(Name, Description),
-  Metric = #metric{
+  #metric{
     name = {otel, Name},
     handle = Ref,
     collect = {instrument_gauge, collect, [Info, Ref]}
-  },
-  ok = instrument_metric:register(Metric),
-  Metric;
+  };
 
 create_underlying_metric(Name, histogram, Opts) ->
   %% Use histogram NIF
@@ -449,22 +445,18 @@ create_underlying_metric(Name, histogram, Opts) ->
     B -> B
   end,
   Description = maps:get(description, Opts, <<>>),
-  Metric = instrument_histogram:new_histogram(Name, Description, Boundaries),
-  ok = instrument_metric:register(Metric),
-  Metric;
+  instrument_histogram:new_histogram(Name, Description, Boundaries);
 
 create_underlying_metric(Name, gauge, Opts) ->
   %% Use gauge NIF
   {ok, Ref} = instrument_nif:new_gauge(),
   Description = maps:get(description, Opts, <<>>),
   Info = instrument_lib:mk_info(Name, Description),
-  Metric = #metric{
+  #metric{
     name = {otel, Name},
     handle = Ref,
     collect = {instrument_gauge, collect, [Info, Ref]}
-  },
-  ok = instrument_metric:register(Metric),
-  Metric.
+  }.
 
 %% Map observable kind → underlying storage by delegating to the synchronous
 %% create_underlying_metric/3. The underlying storage shape and the
@@ -495,14 +487,30 @@ register_instrument(Name, Instrument) ->
     false -> persistent_term:put(otel_instruments, [Name | Names])
   end.
 
+%% Register the base instrument's underlying metric the first time it is
+%% written via the unlabeled path. Attributed-only instruments never call
+%% this, so no phantom zero-valued base series is ever exported.
+ensure_base_registered(#metric{name = Name} = Metric) ->
+  case instrument_registry:lookup(Name) of
+    undefined ->
+      _ = catch instrument_metric:register(Metric),
+      ok;
+    _ ->
+      ok
+  end;
+ensure_base_registered(_) ->
+  ok.
+
 %% Unlabeled — kind-agnostic; gauge NIF is sign-permissive.
-do_add(#metric{handle = {Ref, _StartTime}}, _Kind, Value, Attrs)
+do_add(#metric{handle = {Ref, _StartTime}} = Metric, _Kind, Value, Attrs)
         when is_number(Value), map_size(Attrs) =:= 0 ->
   %% counter-shaped handle (start_time tracked for cumulative temporality)
+  ensure_base_registered(Metric),
   instrument_nif:inc_gauge(Ref, float(Value));
-do_add(#metric{handle = Ref}, _Kind, Value, Attrs)
+do_add(#metric{handle = Ref} = Metric, _Kind, Value, Attrs)
         when is_number(Value), map_size(Attrs) =:= 0, is_reference(Ref) ->
   %% gauge-shaped handle (plain ref)
+  ensure_base_registered(Metric),
   instrument_nif:inc_gauge(Ref, float(Value));
 
 %% Labeled counter — unchanged behaviour (monotonic vec storage).
@@ -531,6 +539,7 @@ do_add(_, _, _, _) ->
 
 do_record(#metric{} = Metric, _Kind, Value, Attrs)
         when is_number(Value), map_size(Attrs) =:= 0 ->
+  ensure_base_registered(Metric),
   instrument_histogram:observe_histogram(Metric, Value);
 do_record(#metric{name = Name} = Metric, _Kind, Value, Attrs)
         when is_number(Value), map_size(Attrs) > 0 ->
@@ -540,13 +549,15 @@ do_record(#metric{name = Name} = Metric, _Kind, Value, Attrs)
 do_record(_, _, _, _) ->
   {error, invalid_handle}.
 
-do_set(#metric{handle = {Ref, _StartTime}}, _Kind, Value, Attrs)
+do_set(#metric{handle = {Ref, _StartTime}} = Metric, _Kind, Value, Attrs)
         when is_number(Value), map_size(Attrs) =:= 0 ->
   %% counter-shaped handle (observable_counter unlabeled write)
+  ensure_base_registered(Metric),
   instrument_nif:set_gauge(Ref, float(Value));
-do_set(#metric{handle = Ref}, _Kind, Value, Attrs)
+do_set(#metric{handle = Ref} = Metric, _Kind, Value, Attrs)
         when is_number(Value), map_size(Attrs) =:= 0, is_reference(Ref) ->
   %% gauge-shaped handle (gauge / up_down_counter / observable_gauge / observable_up_down_counter)
+  ensure_base_registered(Metric),
   instrument_nif:set_gauge(Ref, float(Value));
 do_set(#metric{name = Name} = Metric, _Kind, Value, Attrs)
         when is_number(Value), map_size(Attrs) > 0 ->
