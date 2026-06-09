@@ -6,6 +6,7 @@
 -author("benoitc").
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
 
 %% API
 -export([
@@ -38,7 +39,8 @@
   prometheus_meter_counter/1,
   prometheus_meter_gauge/1,
   prometheus_meter_histogram/1,
-  format_name_tuple_test/1
+  format_name_tuple_test/1,
+  otel_attributed_union_test/1
 ]).
 
 all() ->
@@ -67,7 +69,8 @@ groups() ->
       prometheus_meter_counter,
       prometheus_meter_gauge,
       prometheus_meter_histogram,
-      format_name_tuple_test
+      format_name_tuple_test,
+      otel_attributed_union_test
     ]}
   ].
 
@@ -275,3 +278,25 @@ format_name_tuple_test(_Config) ->
   nomatch = binary:match(Output, <<"{otel">>),
   nomatch = binary:match(Output, <<"otel_vec">>),
   ok.
+
+otel_attributed_union_test(_Config) ->
+  _ = instrument_meter:unregister_all_instruments(),
+  Meter = instrument_meter:get_meter(<<"prom_union">>),
+  C = instrument_meter:create_counter(Meter, <<"preq_total">>, #{}),
+  ok = instrument_meter:add(C, 2, #{method => <<"GET">>}),
+  ok = instrument_meter:add(C, 3, #{method => <<"GET">>, status => 200}),
+
+  Text = instrument_prometheus:format(),
+
+  %% No derived/mangled series name.
+  ?assertEqual(nomatch, binary:match(Text, <<"preq_total_method">>)),
+  %% Exactly one TYPE line for the metric.
+  ?assertEqual(1, count_substr(Text, <<"# TYPE preq_total_total counter">>)),
+  %% The single-key row is empty-filled on `status` (union of {method},{method,status}).
+  ?assertNotEqual(nomatch, binary:match(Text, <<"preq_total_total{method=\"GET\",status=\"\"} 2">>)),
+  ?assertNotEqual(nomatch, binary:match(Text, <<"preq_total_total{method=\"GET\",status=\"200\"} 3">>)),
+  ok.
+
+%% count non-overlapping occurrences of Needle in Hay
+count_substr(Hay, Needle) ->
+  length(binary:matches(Hay, Needle)).

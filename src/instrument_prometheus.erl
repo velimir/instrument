@@ -18,7 +18,7 @@ content_type() ->
 %% @doc Formats all registered metrics in Prometheus text exposition format
 -spec format() -> binary().
 format() ->
-  Metrics = instrument_registry:collect_all(),
+  Metrics = instrument_otel_streams:group(instrument_registry:collect_all()),
   iolist_to_binary([format_metric(M) || M <- Metrics]).
 
 -spec format_metric(map()) -> iolist().
@@ -42,14 +42,15 @@ format_counter(#{name := Name, help := Help, val := Val}) ->
     TotalName, <<" ">>, format_value(Val), <<"\n">>
   ];
 %% Counter vec with labels
-format_counter(#{name := Name, help := Help, labels := Labels, data := Data}) ->
+format_counter(#{name := Name, help := Help, data := Data}) ->
   NameBin = format_name(Name),
   TotalName = <<NameBin/binary, "_total">>,
+  Union = union_labels(Data),
   [
     <<"# HELP ">>, TotalName, <<" ">>, escape_help(Help), <<"\n">>,
     <<"# TYPE ">>, TotalName, <<" counter\n">>,
-    [format_labeled_value(TotalName, Labels, LabelVals, Val)
-     || {_LabelNames, LabelVals, Val} <- Data]
+    [format_labeled_value(TotalName, Union, pad_row(Union, RowNames, RowVals), Val)
+     || {RowNames, RowVals, Val} <- Data]
   ].
 
 -spec format_gauge(map()) -> iolist().
@@ -62,13 +63,14 @@ format_gauge(#{name := Name, help := Help, val := Val}) ->
     NameBin, <<" ">>, format_value(Val), <<"\n">>
   ];
 %% Gauge vec with labels
-format_gauge(#{name := Name, help := Help, labels := Labels, data := Data}) ->
+format_gauge(#{name := Name, help := Help, data := Data}) ->
   NameBin = format_name(Name),
+  Union = union_labels(Data),
   [
     <<"# HELP ">>, NameBin, <<" ">>, escape_help(Help), <<"\n">>,
     <<"# TYPE ">>, NameBin, <<" gauge\n">>,
-    [format_labeled_value(NameBin, Labels, LabelVals, Val)
-     || {_LabelNames, LabelVals, Val} <- Data]
+    [format_labeled_value(NameBin, Union, pad_row(Union, RowNames, RowVals), Val)
+     || {RowNames, RowVals, Val} <- Data]
   ].
 
 -spec format_histogram(map()) -> iolist().
@@ -84,13 +86,14 @@ format_histogram(#{name := Name, help := Help, count := Count, sum := Sum, bucke
     NameBin, <<"_count ">>, format_value(Count), <<"\n">>
   ];
 %% Histogram vec with labels
-format_histogram(#{name := Name, help := Help, labels := Labels, data := Data}) ->
+format_histogram(#{name := Name, help := Help, data := Data}) ->
   NameBin = format_name(Name),
+  Union = union_labels(Data),
   [
     <<"# HELP ">>, NameBin, <<" ">>, escape_help(Help), <<"\n">>,
     <<"# TYPE ">>, NameBin, <<" histogram\n">>,
-    [format_histogram_data(NameBin, Labels, LabelVals, Val)
-     || {_LabelNames, LabelVals, Val} <- Data]
+    [format_histogram_data(NameBin, Union, pad_row(Union, RowNames, RowVals), Val)
+     || {RowNames, RowVals, Val} <- Data]
   ].
 
 -spec format_histogram_data(binary(), list(), list(), map()) -> iolist().
@@ -134,6 +137,16 @@ format_bucket_le(Le) when is_integer(Le) ->
 format_labeled_value(Name, Labels, LabelVals, Val) ->
   LabelPairs = lists:zip(Labels, LabelVals),
   [Name, format_labels(LabelPairs), <<" ">>, format_value(Val), <<"\n">>].
+
+%% Union of label names across all rows of a grouped metric, sorted for
+%% stable output. Rows that lack a label render it as an empty string.
+union_labels(Data) ->
+  lists:usort(lists:append([Names || {Names, _Vals, _V} <- Data])).
+
+%% Pad one row's values to the union label set, empty-filling absent keys.
+pad_row(Union, RowNames, RowVals) ->
+  RowMap = maps:from_list(lists:zip(RowNames, RowVals)),
+  [maps:get(L, RowMap, <<"">>) || L <- Union].
 
 -spec format_labels(list()) -> iolist() | binary().
 format_labels([]) ->
