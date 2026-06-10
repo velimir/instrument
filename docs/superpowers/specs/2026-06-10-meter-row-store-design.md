@@ -25,6 +25,112 @@ Per attributed write, the pre-existing path (unchanged by A1) rebuilds the deriv
 
 The identity question — *which rows belong to which instrument, under what name, with what label union* — only changes at two rare moments: instrument creation and the first write of a new attribute set. A1 re-derives the answer every scrape. This design stores the answer at those two moments and makes both hot paths read-only.
 
+### The same instrument's storage, today vs after
+
+`requests` counter, written once with no attrs, once with `#{method, status}`, once with `#{region}`. (Storage is identical on master and the A1 branch — A1 changed the render layer, not storage; they differ only in how the base entry gets registered.)
+
+**Today — three registry entries, two under derived names, re-joined at every scrape:**
+
+```mermaid
+flowchart LR
+  OI["caller holds<br/>#otel_instrument{name = requests,<br/>handle = the base #metric record}"]
+
+  subgraph PT["persistent_term"]
+    IDX["instrument_metrics index — 3 entries<br/>for one instrument"]
+    PM0["{instrument_metric, {otel, requests}}"]
+    PM1["{instrument_metric,<br/>{otel_vec, requests_method_status}}"]
+    PM2["{instrument_metric,<br/>{otel_vec, requests_region}}"]
+    VL["side-table {otel_instrument_vecs, ...}<br/>[vec names] — read every scrape,<br/>leaks on registry restart"]
+    CV1["row cache {instrument_label,<br/>{otel_vec, requests_method_status},<br/>[GET, 200]}"]
+    CV2["row cache {instrument_label,<br/>{otel_vec, requests_region}, [eu]}"]
+  end
+
+  subgraph RECS["three registry records — two under derived names"]
+    B["base #metric{handle = {Ref0, T0}}<br/>master: eager — the phantom 0<br/>A1: lazy-registration hack"]
+    V1["#vector{labels = [method, status],<br/>labels_map: [GET,200] → row}"]
+    V2["#vector{labels = [region],<br/>labels_map: [eu] → row}"]
+  end
+
+  subgraph NIFS["NIF atomics"]
+    A0["Ref0"]
+    A1n["Ref1"]
+    A2n["Ref2"]
+  end
+
+  ETS["ETS replicas:<br/>schedulers × 3 records"]
+
+  GRP["every scrape: otel_name_index/0 + group/2<br/>re-join the 3 entries under requests"]
+
+  OI -. same term .-> B
+  IDX --> PM0
+  IDX --> PM1
+  IDX --> PM2
+  PM0 --> B
+  PM1 --> V1
+  PM2 --> V2
+  B --> A0
+  V1 --> A1n
+  V2 --> A2n
+  CV1 --> V1
+  CV2 --> V2
+  VL -.-> GRP
+  PM0 -.-> GRP
+  PM1 -.-> GRP
+  PM2 -.-> GRP
+  B -. copied .-> ETS
+  V1 -. copied .-> ETS
+  V2 -. copied .-> ETS
+```
+
+**After — one entry under the real name; identity is data, not derivation:**
+
+```mermaid
+flowchart LR
+  OI2["caller holds<br/>#otel_instrument{name = requests,<br/>handle = {otel, requests}}"]
+
+  subgraph PT2["persistent_term"]
+    IDX2["instrument_metrics index — 1 entry"]
+    PM["{instrument_metric, {otel, requests}}"]
+    K0["row cache {instrument_label,<br/>{otel, requests}, {[],[]}}"]
+    K1["row cache {instrument_label, {otel, requests},<br/>{[method,status], [GET,200]}}"]
+    K2["row cache {instrument_label, {otel, requests},<br/>{[region], [eu]}}"]
+  end
+
+  subgraph REC2["one registry record — real name"]
+    OR["#otel_rows{kind, help, start_time,<br/>union = [method, region, status],<br/>rows: 3, incl. {[],[]} for unlabeled}"]
+  end
+
+  subgraph NIFS2["NIF atomics"]
+    B0["Ref0"]
+    B1["Ref1"]
+    B2["Ref2"]
+  end
+
+  ETS2["ETS replicas:<br/>schedulers × 1 record"]
+
+  SC["every scrape: 1 pt get + row fold —<br/>no index, no rename, no grouping"]
+
+  OI2 -. writes by name only .-> K1
+  IDX2 --> PM
+  PM --> OR
+  OR --> B0
+  OR --> B1
+  OR --> B2
+  K0 --> B0
+  K1 --> B1
+  K2 --> B2
+  PM -.-> SC
+  OR -. copied on row creation .-> ETS2
+```
+
+What the diff buys, structurally:
+
+- 3 registry entries (2 with derived names) → **1 entry, real name only**; nothing to rename or re-join, ever.
+- `{otel_instrument_vecs}` side-table + per-scrape `otel_name_index/0` + `group/2` → **identity stored in `#otel_rows`** (rows, union), written at creation moments.
+- The base series (eager phantom on master / lazy hack on A1) → **the `{[],[]}` row**, which exists iff it was written.
+- Caller handle: a full `#metric` record → **just the name**.
+- Row cache keys: derived vec name + values → **real name + canonical attrs**, so the fast path needs one get instead of two.
+
 ## 2. Goals and non-goals
 
 **Goals**
@@ -128,6 +234,62 @@ flowchart LR
 ```
 
 The row-cache entries and the record's `rows` map point at the **same** row records; the cache exists so the write fast path resolves a row with a single pt get, without touching the (potentially large) parent record.
+
+### Data-structure inventory: who reads it, who writes it, why it exists
+
+**New in this design**
+
+- **`#otel_rows{}`** — the instrument container; the `handle` of the one registry record.
+  - *Read:* every scrape (`collect_instrument` takes kind/help/start_time/union/rows); every slow-path write (membership re-check, `map_size(rows)` cardinality pre-check, histogram `boundaries`); unregister (cleanup walks it).
+  - *Written:* once at `create_*` (kind, help, start_time, boundaries); once per new attribute set (gen_server adds the row, merges the union, re-puts the record).
+  - *Why:* the stored answer to "which rows, union, and metadata belong to this instrument" — the identity A1 re-derived every scrape. Replaces the per-key-set `#vector` records, the `{otel_instrument_vecs}` side-table, `otel_name_index/0`, and `group/2`.
+
+- **`rows` map** (`#{Canon => row #metric{}}`, inside `#otel_rows`).
+  - *Read:* every scrape (folded, one NIF read per row); slow path (does this attribute set exist?); unregister (drives cache erasure and exemplar cleanup — no external "what to clean" tracking needed).
+  - *Written:* by the gen_server only, once per new attribute set.
+  - *Why:* the single enumerable home of all series of one instrument, including `{[],[]}` for unlabeled writes. Collect needs no registry scan to find series, and the phantom is impossible: a row exists iff it was written.
+
+- **row `#metric{}` wrappers** — one per attribute set; the *same terms* appear as `rows` values and as row-cache values.
+  - *Read/written:* every steady-state write (`WriteFun` NIF op on its handle); every scrape (per-kind getter); unregister (histogram exemplar cleanup).
+  - *Why:* identical shape to today's `#vector.labels_map` rows, so every existing per-kind operation (`inc_counter`, `set_gauge`, `observe_histogram`, the getters, `instrument_histogram:cleanup`) works unmodified — no new storage primitive. Counter rows carry per-row `{Ref, StartTime}`, preserving first-observation times for future per-row OTLP start_time.
+
+- **`Canon`** (`{Names, Values}`) — the canonical attribute form; a key shape, not a store.
+  - *Produced:* on every write by `attrs_to_labels/1` (names sorted, values normalized by `to_label_value/1`).
+  - *Used:* as the `rows` key and the row-cache key's third element.
+  - *Why:* one stable identity per logical attribute set, independent of map ordering and value types (`200` vs `<<"200">>` land on the same row). Row identity without baking label names into metric names — the original mangling bug.
+
+- **`union`** (sorted label-name list, inside `#otel_rows`).
+  - *Read:* every scrape — emitted as the entry's `labels`; Prometheus pads each row against it.
+  - *Written:* `lists:umerge` at row creation, the only moment it can change.
+  - *Why:* Prometheus requires one fixed label column set per family while OTel permits per-row key-sets; storing the union removes A1's per-scrape `usort` + re-union.
+
+- **row cache** (pt `{instrument_label, {otel, Name}, Canon} → row #metric{}`).
+  - *Read:* **every write** — the fast path's single get.
+  - *Written:* once per row at creation (a fresh put — no literal-GC sweep); erased at unregister, driven by the rows map.
+  - *Why:* resolves attrs → row in one lock-free get without touching the potentially large parent record on the hot path. Reuses today's `instrument_label` prefix, so the registry's existing unregister/restart sweeps already cover it.
+
+- **overflow sentinel** (pt `{instrument_label_overflow, {otel, Name}} → overflow row`).
+  - *Read:* slow-path writes once the instrument is at the cardinality limit.
+  - *Written:* once, via the gen_server, on first overflow.
+  - *Why:* overflow happens exactly when write volume is high, so overflowed writes must stay off the gen_server; the row itself is the OTel-spec `otel.metric.overflow` series.
+
+**Pre-existing, kept — their role here**
+
+- **registry entry homes** — pt `{instrument_metric, {otel, Name}}`, the per-scheduler ETS tables, and the pt `instrument_metrics` name list.
+  - *pt entry:* the read path — every scrape (`lookup/1`) and every slow-path write.
+  - *ETS replicas:* registry bookkeeping (registration existence checks, `with/2` fallback); re-inserted on each row creation — the reason creation costs (schedulers + 1) × record size.
+  - *name list:* what `collect_all/0` walks each scrape; written only by the gen_server.
+  - *Why kept:* the library's standard registered-metric plumbing, unchanged; the design's change is that one meter instrument contributes **one** entry instead of 1 + K.
+
+- **instrument descriptor** — pt `{otel_instrument, Name}` (`#otel_instrument{}`) and the pt `otel_instruments` name list.
+  - *Read:* `get_instrument/1` (create-time dedup), `list_instruments/0`, `collect_observables/0` (locating callbacks), the exporter's unit lookup.
+  - *Written:* at create / unregister only.
+  - *Why kept:* the public meter-API descriptor. Changed within it: `handle` no longer holds storage — just `{otel, Name}` (or `{observable, RegName, Callback}`) — so callers cannot hold stale storage references.
+
+- **label accounting** — ETS `instrument_label_counts` rows `{count, Name}` and `{dropped, Name}`.
+  - *Read:* the public `label_count/1` / `cardinality_dropped/1` APIs.
+  - *Written:* `cache_label` increments count at row creation; overflow routing increments dropped.
+  - *Why kept:* API parity only — the limit check itself now uses `map_size(rows)`, which is exact and free.
 
 ## 4. Write path
 
