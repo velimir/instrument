@@ -342,7 +342,7 @@ flowchart TD
    - re-check existence and cardinality under serialization (race losers get the winner's row / the overflow row);
    - mint the row by kind (per-row start time for counters; container boundaries for histograms);
    - update the container: `rows#{Canon => Row}`, `union = lists:umerge(Union, Names)` (`Names` arrives sorted);
-   - `do_reg_metric` (ETS tables + replacing pt put), `cache_label(RegName, Canon, Row)` (fresh pt put, increments the `{count, RegName}` accounting), return the row.
+   - `do_reg_metric` (ETS tables + replacing pt put), cache the row (fresh-key pt put — skipped if a racing writer already cached it, since putting over an existing key is a *replacing* put and would schedule a needless literal-GC sweep; note today's `cache_label/3` puts unconditionally, so the row-store path caches only-if-absent; the put increments the `{count, RegName}` accounting), return the row.
 4. Write.
 
 Same serialization pattern as `create_vector_metric` today: creation is single-writer; fast-path readers see atomic pt snapshots; the worst race outcome is a redundant gen_server round-trip returning the existing row.
@@ -589,7 +589,7 @@ sequenceDiagram
   W->>N: one NIF op
 ```
 
-Delta: two gen_server calls + two literal-GC sweeps → one call + one sweep; cardinality is checked exactly (`map_size`) before the call ever happens; the union is maintained here, so no scrape recomputes it.
+Delta: two gen_server calls + two literal-GC sweeps → one call + one sweep. Of the three storage writes above, only the replacing put of the parent record sweeps: ETS inserts never touch the literal area, and the row-cache put is a fresh key, so nothing dies. (Lifetime totals for R rows over K key-sets: before R + K sweeps, after R.) Cardinality is checked exactly (`map_size`) before the call ever happens; the union is maintained here, so no scrape recomputes it.
 
 ### A.4 Collection — every scrape / export tick
 
