@@ -473,9 +473,11 @@ Escape hatch if 1/3 ever bite: move rows into a dedicated ETS table keyed `{RegN
 
 Conventions: *before* = master 1.1.3 storage (which the A1 branch shares; A1-only divergences are marked). Writes shown are attributed unless noted. Lanes: the calling process, `persistent_term` (pt), the registry gen_server, the per-scheduler ETS tables, NIF atomics.
 
+Each use case is presented as: **Before** — what happens today; **After** — what happens in this design; **Delta** — *only* what changed (`−` removed, `+` added, `→` altered, closing with the net cost change).
+
 ### A.1 Instrument creation — `create_counter/2,3`
 
-**Before:**
+**Before:** mint the base NIF storage up front and eagerly register the base entry (master) — A1 instead defers that registration to the first unlabeled write. The caller's descriptor holds the whole base `#metric` record.
 
 ```mermaid
 sequenceDiagram
@@ -492,7 +494,7 @@ sequenceDiagram
   App->>PT: put {otel_instrument, Name} descriptor (handle = the base record)
 ```
 
-**After:**
+**After:** build the `#otel_rows` container and register the one entry under the real name; the descriptor holds just the name. No storage is allocated.
 
 ```mermaid
 sequenceDiagram
@@ -508,11 +510,17 @@ sequenceDiagram
   Note over App,PT: entry collects data=[] until first write — exporters emit nothing
 ```
 
-Delta: one registration either way; storage allocation moves from create to first write; the phantom is impossible by construction rather than suppressed by a lazy-registration hack.
+**Delta:**
+
+- − NIF allocation at create — storage is now minted per row, at first write
+- − the eagerly-registered base series (master's phantom zero) and − A1's lazy-registration hack — there is nothing to suppress
+- \+ `#otel_rows` container (kind, help, start_time, boundaries) built once and registered under the real name
+- → descriptor `handle`: full base `#metric` record → `{otel, Name}`
+- net: one registration call either way; creation does strictly less work, and a never-written instrument emits nothing by construction
 
 ### A.2 Write, steady state — every write after the row exists
 
-**Before:**
+**Before:** every attributed write canonicalizes the attrs, rebuilds the derived vec-name binary, checks the vec exists (pt get 1), resolves the row (pt get 2), then does the NIF op. Unlabeled writes take a separate path through the descriptor's handle.
 
 ```mermaid
 sequenceDiagram
@@ -527,7 +535,7 @@ sequenceDiagram
   Note over W,N: unlabeled write — pt get (ensure_base_registered, A1) + NIF on the handle held in the descriptor
 ```
 
-**After:**
+**After:** every write canonicalizes and resolves its row in one pt get, then the NIF op — the same path whether attributes are present or not.
 
 ```mermaid
 sequenceDiagram
@@ -540,11 +548,17 @@ sequenceDiagram
   Note over W,N: identical for unlabeled writes — Canon = {[],[]}
 ```
 
-Delta: the per-write name-binary build and the second pt get are gone; labeled and unlabeled writes become one path.
+**Delta:**
+
+- − `make_vec_name` derived-name binary built on every write
+- − 1 pt get (the vec-existence check)
+- − the separate unlabeled write path (and A1's `ensure_base_registered` get with it)
+- → row-cache key: `{derived vec name, values}` → `{real name, Canon}`
+- net per write: sort + binary build + 2 pt gets + NIF → sort + 1 pt get + NIF
 
 ### A.3 Write, first of a new attribute set — the paid "init moment"
 
-**Before:**
+**Before:** on a row-cache miss, first ensure the vec exists — for a new key-set that's a registration (gen_server call 1) plus the side-table put — then create the row (gen_server call 2, re-putting the grown vec record), cache it, write.
 
 ```mermaid
 sequenceDiagram
@@ -568,7 +582,7 @@ sequenceDiagram
   Note over W,N: a new value-combination within a known key-set skips call 1
 ```
 
-**After:**
+**After:** on a row-cache miss, read the parent once (row membership + exact cardinality), then one gen_server call mints the row, re-puts the record (rows + union), caches the row if absent, write.
 
 ```mermaid
 sequenceDiagram
@@ -589,11 +603,20 @@ sequenceDiagram
   W->>N: one NIF op
 ```
 
-Delta: two gen_server calls + two literal-GC sweeps → one call + one sweep. Of the three storage writes above, only the replacing put of the parent record sweeps: ETS inserts never touch the literal area, and the row-cache put is a fresh key, so nothing dies. (Lifetime totals for R rows over K key-sets: before R + K − 1 — every new row re-puts its vec record, and each key-set beyond the first re-puts the side-table; after R — exactly one per row. Equal in the common case, fewer whenever extra key-sets appear; neither design sweeps on steady writes or scrapes.) Cardinality is checked exactly (`map_size`) before the call ever happens; the union is maintained here, so no scrape recomputes it.
+**Delta:**
+
+- − 1 gen_server call (the vec registration; new-key-set case)
+- − 1 literal-GC sweep (the side-table re-put; key-sets beyond the first)
+- − `{otel_instrument_vecs}` side-table maintenance
+- \+ exact `map_size` cardinality pre-check before the call (before: an ETS counter read on the label path)
+- \+ union maintained at this moment (before: recomputed on every scrape)
+- \+ cache only-if-absent rule — today's `cache_label` re-puts on races, which is a replacing put and a needless sweep
+- → the record replaced per creation covers the whole instrument, O(all rows), instead of one key-set, O(that vec's rows) — §10 cost 1
+- net per new attribute set: 1–2 calls and 1–2 sweeps → 1 call and 1 sweep (of the after-side's three storage writes, only the record re-put sweeps: ETS never touches the literal area; the cache put is a fresh key). Lifetime sweeps for R rows over K key-sets: R + K − 1 → R. Neither design sweeps on steady writes or scrapes.
 
 ### A.4 Collection — every scrape / export tick
 
-**Before (A1):**
+**Before (A1):** collect every registry entry separately — the base and each vec, every vec re-looking itself up — then rebuild the name index from the descriptors and side-tables, rename every entry, group, union, and (Prometheus) re-union + pad.
 
 ```mermaid
 sequenceDiagram
@@ -615,7 +638,7 @@ sequenceDiagram
   X->>X: prometheus — re-union + pad per row
 ```
 
-**After:**
+**After:** collect N entries; each reads its own record once and NIF-reads its rows; the formatters consume the stored union and skip empty instruments.
 
 ```mermaid
 sequenceDiagram
@@ -632,11 +655,19 @@ sequenceDiagram
   X->>X: format — union already stored, pad is a no-op for single key-set, data=[] skipped
 ```
 
-Delta: N+K entry collects with self-re-lookups, a rebuilt name index (2 pt gets per instrument), renaming, grouping, and per-scrape unions — all replaced by N lookups + the irreducible row reads.
+**Delta:**
+
+- − K extra per-entry collects and the per-vec self-re-lookup
+- − the name-index rebuild: 2 pt gets per instrument, every scrape, discarded after use
+- − the rename pass, the grouping fold, the per-scrape `usort` unions, the `first_non_empty` help scan
+- − Prometheus per-family union recompute (`union_labels/1`; it reads the entry's stored `labels` instead)
+- \+ `data == []` skip clauses in both formatters (the phantom-suppression mechanism, moved to format time)
+- \+ stream `start_time` on attributed OTLP data points (dropped entirely today)
+- net per scrape: N+K collects + index build + grouping → N lookups + the irreducible per-row NIF reads
 
 ### A.5 Observable cycle — runs inside every export tick
 
-**Before:**
+**Before:** each observation, on every cycle, re-derives the vec name and re-checks vec existence before resolving its row.
 
 ```mermaid
 sequenceDiagram
@@ -654,7 +685,7 @@ sequenceDiagram
   Note over X,N: then the A1 collection sequence (A.4 before)
 ```
 
-**After:**
+**After:** each observation is a standard fast-path write.
 
 ```mermaid
 sequenceDiagram
@@ -671,11 +702,15 @@ sequenceDiagram
   Note over X,N: then the plain collection sequence (A.4 after)
 ```
 
-Delta: observables pay the write fast path like everyone else; today they re-run the vec-ensure machinery on every observation of every cycle.
+**Delta:**
+
+- − `make_vec_name` + the vec-existence pt get, per observation, per cycle
+- − the observable-only write path (`store_observable_observation`, `storage_type`) — observables use the same `do_write` as sync instruments
+- net per observation: binary build + 2 pt gets + NIF → 1 pt get + NIF
 
 ### A.6 Unregister — admin-time
 
-**Before:**
+**Before:** unregister the base entry, read the side-table, unregister each vec with its own gen_server call, then erase the side-table and the descriptor.
 
 ```mermaid
 sequenceDiagram
@@ -691,7 +726,7 @@ sequenceDiagram
   App->>PT: erase vecs side-table + descriptor + names list
 ```
 
-**After:**
+**After:** one unregister call — the registry walks the rows map, erasing row caches and running exemplar cleanup — then erase the descriptor.
 
 ```mermaid
 sequenceDiagram
@@ -703,4 +738,9 @@ sequenceDiagram
   App->>PT: erase descriptor + names list
 ```
 
-Delta: 1 + K gen_server calls and a side-table walk → one call; the rows map itself is the cleanup manifest.
+**Delta:**
+
+- − K gen_server calls (one per vec)
+- − the side-table read + erase (and, with the key itself, its registry-restart leak)
+- \+ `#otel_rows` clauses in the registry's two cleanup helpers — the rows map is the cleanup manifest, no external tracking
+- net: 1 + K calls → 1 call
