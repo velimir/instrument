@@ -557,7 +557,7 @@ sequenceDiagram
   W->>R: register new #vector vec — gen_server call 1
   R->>E: insert vec record
   R->>PT: put vec record + index (fresh keys)
-  W->>PT: replacing put {otel_instrument_vecs, Base} → literal sweep 1
+  W->>PT: put {otel_instrument_vecs, Base} → sweep 1 (fresh put for the very first key-set — that one does not sweep)
   W->>PT: get {instrument_label, VecName, Values} → undefined
   W->>R: create_vector_metric — gen_server call 2
   R->>N: mint row storage
@@ -589,7 +589,7 @@ sequenceDiagram
   W->>N: one NIF op
 ```
 
-Delta: two gen_server calls + two literal-GC sweeps → one call + one sweep. Of the three storage writes above, only the replacing put of the parent record sweeps: ETS inserts never touch the literal area, and the row-cache put is a fresh key, so nothing dies. (Lifetime totals for R rows over K key-sets: before R + K sweeps, after R.) Cardinality is checked exactly (`map_size`) before the call ever happens; the union is maintained here, so no scrape recomputes it.
+Delta: two gen_server calls + two literal-GC sweeps → one call + one sweep. Of the three storage writes above, only the replacing put of the parent record sweeps: ETS inserts never touch the literal area, and the row-cache put is a fresh key, so nothing dies. (Lifetime totals for R rows over K key-sets: before R + K − 1 — every new row re-puts its vec record, and each key-set beyond the first re-puts the side-table; after R — exactly one per row. Equal in the common case, fewer whenever extra key-sets appear; neither design sweeps on steady writes or scrapes.) Cardinality is checked exactly (`map_size`) before the call ever happens; the union is maintained here, so no scrape recomputes it.
 
 ### A.4 Collection — every scrape / export tick
 
