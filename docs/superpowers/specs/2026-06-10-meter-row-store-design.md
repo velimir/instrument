@@ -87,6 +87,48 @@ Row names are decorative (`{otel_row, Name, Canon}`, never registered).
 
 **Caller handle.** `#otel_instrument.handle` shrinks to `{otel, Name}` for sync instruments and `{observable, {otel, Name}, Callback}` for observables. Writes need nothing else.
 
+Everything above in one picture (`requests` counter after one unlabeled write and one `#{method, status}` write):
+
+```mermaid
+flowchart LR
+  OI["caller holds<br/>#otel_instrument{name = Name,<br/>handle = {otel, Name}}"]
+
+  subgraph PT["persistent_term — lock-free reads"]
+    IDX["instrument_metrics index<br/>[ {otel, Name} | ... ]"]
+    PM["{instrument_metric, {otel, Name}}"]
+    C0["row cache<br/>{instrument_label, {otel, Name}, {[],[]}}"]
+    C1["row cache<br/>{instrument_label, {otel, Name},<br/>{[method, status], [GET, 200]}}"]
+  end
+
+  subgraph REC["the one registry record (pt value)"]
+    META["#metric{name = {otel, Name},<br/>collect = collect_instrument}"]
+    ROWS["#otel_rows{kind, help, start_time, boundaries,<br/>union = [method, status], rows}"]
+    R0["row {[],[]}<br/>#metric{handle = {Ref0, T0}}"]
+    R1["row {[method,status],[GET,200]}<br/>#metric{handle = {Ref1, T1}}"]
+  end
+
+  subgraph NIF["NIF atomics"]
+    A0["Ref0"]
+    A1["Ref1"]
+  end
+
+  ETS["ETS replicas — one table per scheduler,<br/>same record, bookkeeping only"]
+
+  OI -. "writes use name only" .-> C1
+  IDX -. "collect_all walks" .-> PM
+  PM --> META
+  META --> ROWS
+  ROWS --> R0
+  ROWS --> R1
+  C0 --> R0
+  C1 --> R1
+  R0 --> A0
+  R1 --> A1
+  META -. "copied on row creation" .-> ETS
+```
+
+The row-cache entries and the record's `rows` map point at the **same** row records; the cache exists so the write fast path resolves a row with a single pt get, without touching the (potentially large) parent record.
+
 ## 4. Write path
 
 All of `add/3`, `record/3`, `set/3` — labeled and unlabeled — funnel into one function. The API clauses keep their kind/sign guards (`counter` requires `Value >= 0`, up_down_counter sign-splits to `inc_gauge`/`dec_gauge`) and select a `WriteFun`; the six near-duplicate `do_add`/`do_record`/`do_set` clause pairs collapse.
@@ -106,6 +148,29 @@ B,      attributed:  sort attrs → pt get (row) → NIF
 master, unlabeled:   pt get (ensure_base_registered, A1) → NIF
 B,      unlabeled:   pt get (row cache, key {[],[]}) → NIF
 ```
+
+```mermaid
+flowchart TD
+  W["add / record / set(Instrument, Value, Attrs)"] --> CAN["Canon = attrs_to_labels(Attrs)<br/>{[],[]} when no attrs"]
+  CAN --> GET{"pt get<br/>{instrument_label, RegName, Canon}"}
+  GET -->|"hit — steady state"| NIF["WriteFun(Row): one NIF op"]
+  GET -->|"miss — first write of this attr set"| PAR["pt get parent record"]
+  PAR --> EX{"Canon already in rows?"}
+  EX -->|"yes — cache raced"| RC["cache_label"] --> NIF
+  EX -->|no| CARD{"map_size(rows) >= limit?"}
+  CARD -->|yes| OVF["overflow row<br/>(pt-cached sentinel)"] --> NIF
+  CARD -->|no| GS["gen_server: create_otel_row<br/>(serialized; re-checks existence + limit)"]
+  GS --> MINT["mint row storage by kind<br/>counter: {Ref, now} - gauge: Ref - histogram: container boundaries"]
+  MINT --> UPD["rows + Canon, union merge Names<br/>do_reg_metric: ETS x schedulers + replacing pt put<br/>cache_label: fresh pt put"]
+  UPD --> NIF
+
+  classDef fast fill:#d4edda,stroke:#28a745
+  classDef once fill:#fff3cd,stroke:#b8860b
+  class W,CAN,GET,NIF fast
+  class PAR,EX,RC,CARD,OVF,GS,MINT,UPD once
+```
+
+*Green: runs on every write. Amber: runs once per (instrument, attribute-set) — the agreed "init moment".*
 
 **Slow path** — once per distinct attribute set over the instrument's lifetime:
 
@@ -146,6 +211,19 @@ collect_instrument(RegName) ->
 - New skip clause in each: `data := []` emits nothing. That is the entire phantom story: a created-but-never-written instrument collects an empty row set and produces no output (matches OTel SDKs). Note the registration mechanism differs from A1 (eager entry + empty-data skip, vs A1's lazy base registration) but the observable behavior is identical: nothing exported until first write.
 - Prometheus labeled clauses read the union from the entry's `labels` key (which `instrument_vector:collect/1` also already provides) instead of recomputing; `union_labels/1` is deleted. `pad_row/3` stays for heterogeneous rows, with a fast first clause `pad_row(Union, Union, Vals) -> Vals` — the common case (single key-set; every standalone vec) pads for free.
 - Unlabeled-only output bytes are identical to today: a `{[], [], Val}` row under an empty union renders `requests_total 42`.
+
+```mermaid
+flowchart LR
+  TICK["scrape / export tick"] --> CA["instrument_registry:collect_all()"]
+  CA -->|"for each name in<br/>instrument_metrics"| CI["collect_instrument(RegName)"]
+  CI --> PT2["1 pt get: parent record"]
+  PT2 --> FOLD["fold rows:<br/>1 NIF read per row"]
+  FOLD --> OUT["#{name, type, help, start_time,<br/>labels = stored union,<br/>data = [{Names, Values, Val}]}"]
+  OUT --> SKIP{"data == [] ?"}
+  SKIP -->|"yes — created, never written"| NONE["emit nothing"]
+  SKIP -->|no| PROM["prometheus: pad rows to union<br/>(no-op when row names == union)"]
+  SKIP -->|no| OTLP["OTLP / console: per-row attributes,<br/>stream start_time on data points"]
+```
 
 ## 6. OTLP/console exporter changes
 
