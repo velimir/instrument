@@ -466,3 +466,241 @@ Escape hatch if 1/3 ever bite: move rows into a dedicated ETS table keyed `{RegN
 - Independent of PR #10 (histogram OTLP): that PR changes `instrument_metrics_exporter_otlp.erl` (encode layer); this design changes `instrument_metrics_exporter.erl` (convert layer). Different files, either lands first.
 - Overlaps PR #9 (`observable-collection-context`) only in the observables corner (§8); coordinate landing order.
 - CHANGELOG: `## [Unreleased]` entries per §11.
+
+---
+
+## Appendix A — use-case sequence diagrams, before vs after
+
+Conventions: *before* = master 1.1.3 storage (which the A1 branch shares; A1-only divergences are marked). Writes shown are attributed unless noted. Lanes: the calling process, `persistent_term` (pt), the registry gen_server, the per-scheduler ETS tables, NIF atomics.
+
+### A.1 Instrument creation — `create_counter/2,3`
+
+**Before:**
+
+```mermaid
+sequenceDiagram
+  participant App as caller
+  participant N as NIF atomics
+  participant R as registry (gen_server)
+  participant E as ETS ×schedulers
+  participant PT as persistent_term
+  App->>N: new_gauge() — base storage minted up front
+  App->>R: register base #metric (master — A1 defers this to the first unlabeled write)
+  R->>E: insert base record
+  R->>PT: put {instrument_metric, {otel,Name}} + name into index
+  Note over R,PT: master — the base now exports 0 forever: the phantom
+  App->>PT: put {otel_instrument, Name} descriptor (handle = the base record)
+```
+
+**After:**
+
+```mermaid
+sequenceDiagram
+  participant App as caller
+  participant R as registry (gen_server)
+  participant E as ETS ×schedulers
+  participant PT as persistent_term
+  App->>App: build #otel_rows{kind, help, start_time, boundaries} — no NIF allocation
+  App->>R: register #metric{name = {otel,Name}, handle = #otel_rows{}}
+  R->>E: insert record
+  R->>PT: put {instrument_metric, {otel,Name}} + name into index
+  App->>PT: put {otel_instrument, Name} descriptor (handle = {otel,Name})
+  Note over App,PT: entry collects data=[] until first write — exporters emit nothing
+```
+
+Delta: one registration either way; storage allocation moves from create to first write; the phantom is impossible by construction rather than suppressed by a lazy-registration hack.
+
+### A.2 Write, steady state — every write after the row exists
+
+**Before:**
+
+```mermaid
+sequenceDiagram
+  participant W as writer
+  participant PT as persistent_term
+  participant N as NIF atomics
+  W->>W: attrs_to_labels(Attrs) — sort + normalize values
+  W->>W: make_vec_name — rebuild the derived-name binary, every write
+  W->>PT: get {instrument_metric, VecName} — does the vec exist?
+  W->>PT: get {instrument_label, VecName, Values} — the row
+  W->>N: one NIF op
+  Note over W,N: unlabeled write — pt get (ensure_base_registered, A1) + NIF on the handle held in the descriptor
+```
+
+**After:**
+
+```mermaid
+sequenceDiagram
+  participant W as writer
+  participant PT as persistent_term
+  participant N as NIF atomics
+  W->>W: Canon = attrs_to_labels(Attrs)
+  W->>PT: get {instrument_label, {otel,Name}, Canon}
+  W->>N: one NIF op
+  Note over W,N: identical for unlabeled writes — Canon = {[],[]}
+```
+
+Delta: the per-write name-binary build and the second pt get are gone; labeled and unlabeled writes become one path.
+
+### A.3 Write, first of a new attribute set — the paid "init moment"
+
+**Before:**
+
+```mermaid
+sequenceDiagram
+  participant W as writer
+  participant PT as persistent_term
+  participant R as registry (gen_server)
+  participant E as ETS ×schedulers
+  participant N as NIF atomics
+  W->>PT: get {instrument_metric, VecName} → undefined
+  W->>R: register new #vector vec — gen_server call 1
+  R->>E: insert vec record
+  R->>PT: put vec record + index (fresh keys)
+  W->>PT: replacing put {otel_instrument_vecs, Base} → literal sweep 1
+  W->>PT: get {instrument_label, VecName, Values} → undefined
+  W->>R: create_vector_metric — gen_server call 2
+  R->>N: mint row storage
+  R->>E: re-insert grown vec record
+  R->>PT: replacing put vec record → literal sweep 2
+  W->>PT: cache_label — fresh put row
+  W->>N: one NIF op
+  Note over W,N: a new value-combination within a known key-set skips call 1
+```
+
+**After:**
+
+```mermaid
+sequenceDiagram
+  participant W as writer
+  participant PT as persistent_term
+  participant R as registry (gen_server)
+  participant E as ETS ×schedulers
+  participant N as NIF atomics
+  W->>PT: get row cache → undefined
+  W->>PT: get parent record — Canon in rows? at limit?
+  W->>R: create_otel_row(RegName, Canon) — the one gen_server call
+  R->>R: re-check existence + limit
+  R->>N: mint row storage by kind
+  R->>E: re-insert record (rows + union updated)
+  R->>PT: replacing put record → the one literal sweep
+  R->>PT: cache_label — fresh put row
+  R-->>W: row
+  W->>N: one NIF op
+```
+
+Delta: two gen_server calls + two literal-GC sweeps → one call + one sweep; cardinality is checked exactly (`map_size`) before the call ever happens; the union is maintained here, so no scrape recomputes it.
+
+### A.4 Collection — every scrape / export tick
+
+**Before (A1):**
+
+```mermaid
+sequenceDiagram
+  participant X as exporter / scraper
+  participant PT as persistent_term
+  participant N as NIF atomics
+  X->>PT: get instrument_metrics index — N+K entries
+  loop per entry — base and every vec separately
+    X->>PT: lookup entry
+    X->>PT: vector collect re-looks itself up
+    X->>N: read each row
+  end
+  X->>PT: get otel_instruments
+  loop per instrument — rebuild the name index
+    X->>PT: get {otel_instrument, Name}
+    X->>PT: get {otel_instrument_vecs, Base}
+  end
+  X->>X: rename every entry, group fold, usort unions, help scan
+  X->>X: prometheus — re-union + pad per row
+```
+
+**After:**
+
+```mermaid
+sequenceDiagram
+  participant X as exporter / scraper
+  participant PT as persistent_term
+  participant N as NIF atomics
+  X->>PT: get instrument_metrics index — N entries
+  loop per instrument
+    X->>PT: lookup entry — 1 get
+    loop per row
+      X->>N: read row
+    end
+  end
+  X->>X: format — union already stored, pad is a no-op for single key-set, data=[] skipped
+```
+
+Delta: N+K entry collects with self-re-lookups, a rebuilt name index (2 pt gets per instrument), renaming, grouping, and per-scrape unions — all replaced by N lookups + the irreducible row reads.
+
+### A.5 Observable cycle — runs inside every export tick
+
+**Before:**
+
+```mermaid
+sequenceDiagram
+  participant X as exporter tick
+  participant CB as user callback
+  participant PT as persistent_term
+  participant N as NIF atomics
+  X->>CB: Callback(Observer)
+  loop per observation — every cycle
+    CB->>X: Observer(Value, Attrs)
+    X->>X: make_vec_name — rebuild the derived name
+    X->>PT: vec get + row get — 2 gets
+    X->>N: set
+  end
+  Note over X,N: then the A1 collection sequence (A.4 before)
+```
+
+**After:**
+
+```mermaid
+sequenceDiagram
+  participant X as exporter tick
+  participant CB as user callback
+  participant PT as persistent_term
+  participant N as NIF atomics
+  X->>CB: Callback(Observer)
+  loop per observation — every cycle
+    CB->>X: Observer(Value, Attrs)
+    X->>PT: get row cache — 1 get
+    X->>N: set
+  end
+  Note over X,N: then the plain collection sequence (A.4 after)
+```
+
+Delta: observables pay the write fast path like everyone else; today they re-run the vec-ensure machinery on every observation of every cycle.
+
+### A.6 Unregister — admin-time
+
+**Before:**
+
+```mermaid
+sequenceDiagram
+  participant App as caller
+  participant R as registry (gen_server)
+  participant PT as persistent_term
+  App->>R: unregister base entry
+  App->>PT: get {otel_instrument_vecs, Base}
+  loop per vec
+    App->>R: unregister vec — one gen_server call each
+    R->>PT: erase vec record + its row caches (walk labels_map)
+  end
+  App->>PT: erase vecs side-table + descriptor + names list
+```
+
+**After:**
+
+```mermaid
+sequenceDiagram
+  participant App as caller
+  participant R as registry (gen_server)
+  participant PT as persistent_term
+  App->>R: unregister {otel, Name} — one call
+  R->>PT: walk rows — erase each row cache, run exemplar cleanup, erase record + overflow
+  App->>PT: erase descriptor + names list
+```
+
+Delta: 1 + K gen_server calls and a side-table walk → one call; the rows map itself is the cleanup manifest.
