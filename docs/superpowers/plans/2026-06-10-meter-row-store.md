@@ -197,7 +197,10 @@ create_otel_row_overflow_test(_Config) ->
     %% The requested (dropped) Canon is NOT cached — no unbounded pt growth.
     ?assertEqual(undefined,
                  persistent_term:get({instrument_label, RegName, {[a], [<<"3">>]}},
-                                     undefined))
+                                     undefined)),
+    %% The rerouted create counts as a dropped write even though the
+    %% caller never went through the meter's overflow_write pre-check.
+    ?assertEqual(1, instrument_registry:cardinality_dropped(RegName))
   after
     os:unsetenv("OTEL_METRIC_CARDINALITY_LIMIT")
   end,
@@ -282,6 +285,11 @@ do_create_otel_row(RegName, Canon) ->
           AtLimit = map_size(Rows) >= Limit andalso Canon =/= ?OTEL_OVERFLOW_CANON,
           case AtLimit of
             true ->
+              %% The caller's pre-check was stale — this write is being
+              %% rerouted to the overflow row here, so count the drop here
+              %% (the meter-side overflow_write path never reaches this
+              %% branch: it only sends the overflow canon, which is exempt).
+              _ = incr_dropped_count(RegName),
               do_create_otel_row(RegName, ?OTEL_OVERFLOW_CANON);
             false ->
               Row = mk_otel_row(RegName, Canon, Container),

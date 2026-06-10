@@ -187,7 +187,7 @@ Row names are decorative (`{otel_row, Name, Canon}`, never registered).
 **Write fast-path cache.** Same pt prefix as today, keyed by canonical attrs instead of a derived vec name:
 `{instrument_label, {otel, Name}, Canon}` → row `#metric{}`. (Composite third element vs today's values-list — the registry's prefix-based cleanup sweeps cover both shapes.)
 
-**Caller handle.** `#otel_instrument.handle` shrinks to `{otel, Name}` for sync instruments and `{observable, {otel, Name}, Callback}` for observables. Writes need nothing else.
+**Caller handle.** `#otel_instrument.handle` shrinks to `{otel, Name}` for sync instruments and `{observable, {otel, Name}, Callback}` for observables. Writes need nothing else. Identity is the name: a descriptor held across `unregister_instrument` + re-create writes into the successor instrument of the same name — OTel identifies instruments by name within a meter, and master's attributed path already behaved this way (vec names derive from the instrument name). Kind-mismatched stale writes fail on the row operation rather than corrupting.
 
 Everything above in one picture (`requests` counter after one unlabeled write and one `#{method, status}` write):
 
@@ -345,7 +345,7 @@ flowchart TD
 
 Same serialization pattern as `create_vector_metric` today: creation is single-writer; fast-path readers see atomic pt snapshots; the worst race outcome is a redundant gen_server round-trip returning the existing row.
 
-*Considered and rejected:* keying the cache by the raw attrs map (skips the sort) — several raw forms (`200` vs `<<"200">>`) would alias one row, complicating cleanup. Canonicalization happens on every write today; not a regression.
+*Considered and rejected:* keying the cache by the raw attrs map (skips the sort) — several raw forms (`200` vs `<<"200">>`) would alias one row, complicating cleanup. Canonicalization happens on every write today; not a regression. Attribute *keys*, however, are compared as terms: the atom `status` and the binary `<<"status">>` are distinct attributes (rendering as duplicate label names in Prometheus). Key-type consistency is the caller's job; normalizing keys per write would tax the common case to absorb a pathological one (master merged the forms only by accident of its name derivation).
 
 ## 5. Collect path
 
@@ -394,7 +394,7 @@ flowchart LR
 
 - The limit check moves to the slow path only (existing rows are always writable, as today) and becomes `map_size(rows) >= instrument_config:get_metric_cardinality_limit()` — exact, no ETS read.
 - **Per instrument**, as the OTel spec defines it. Today it is per key-set vec: one instrument writing K key-sets can hold K× the configured limit. Behavior change, documented (§11).
-- The overflow series is the spec's overflow attribute set — one ordinary row keyed `{[<<"otel.metric.overflow">>], [<<"true">>]}` — replacing today's per-vec sentinel-filled label sets. It joins the union, collects like any row, and is cached under its own ordinary row-cache key (no separate sentinel key — the rows map stays the single cleanup manifest, and unregister/restart sweeps already cover the `instrument_label` prefix). Sustained overflow stays off the gen_server: each dropped write costs the row-cache miss + the parent pt get (membership + O(1) `map_size` limit check) + the overflow row's cache get + NIF; the gen_server is involved only when the overflow row is first created. The `{dropped, RegName}` ETS counter keeps feeding `cardinality_dropped/1`; the row-cache accounting keeps `label_count/1` reporting.
+- The overflow series is the spec's overflow attribute set — one ordinary row keyed `{[<<"otel.metric.overflow">>], [<<"true">>]}` (the value renders as the string `"true"`: this library's attribute values are uniformly strings end-to-end, master included) — replacing today's per-vec sentinel-filled label sets. It joins the union, collects like any row, and is cached under its own ordinary row-cache key (no separate sentinel key — the rows map stays the single cleanup manifest, and unregister/restart sweeps already cover the `instrument_label` prefix). Sustained overflow stays off the gen_server: each dropped write costs the row-cache miss + the parent pt get (membership + O(1) `map_size` limit check) + the overflow row's cache get + NIF; the gen_server is involved only when the overflow row is first created. The `{dropped, RegName}` ETS counter keeps feeding `cardinality_dropped/1`, counted on both routes — the meter's `overflow_write` pre-check path and the registry's at-limit re-check when it reroutes a create whose caller pre-check was stale — so the counter cannot under-report under races. The row-cache accounting keeps `label_count/1` reporting.
 
 ## 8. Observables
 
