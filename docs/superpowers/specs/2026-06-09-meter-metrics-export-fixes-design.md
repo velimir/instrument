@@ -3,7 +3,7 @@
 - **Date:** 2026-06-09
 - **Library:** `instrument`
 - **Baseline:** `be7e75e` (1.1.3)
-- **Status:** approved design; pending implementation plans
+- **Status:** partially superseded — §5 (PR 1, approach A1) is replaced by `2026-06-10-meter-row-store-design.md` (render-layer grouping added per-scrape overhead; the redesign stores identity at creation time instead). §6 (PR 2, histogram OTLP) is final and shipped as upstream PR #10.
 - **Supersedes / corrects:** `INVESTIGATION-meter-attributed-name-mangling.md`
 - **Delivery:** two independent upstream bugfix PRs to `benoitc/instrument` (PR 1 and PR 2 below). Either can land first.
 
