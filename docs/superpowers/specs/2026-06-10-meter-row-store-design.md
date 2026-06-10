@@ -4,32 +4,29 @@
 - **Library:** `instrument`
 - **Baseline:** `be7e75e` (1.1.3, master)
 - **Status:** approved design; pending implementation plan
-- **Supersedes:** §5 (PR 1, approach A1) of `2026-06-09-meter-metrics-export-fixes-design.md`. §6 of that document (histogram OTLP) is unaffected and shipped as upstream PR #10.
-- **Replaces implementation:** the `meter-attributed-path` branch (A1, unshipped). This design is a fresh implementation from master; A1's behavioral tests are ported as the contract.
+- **Supersedes:** the meter fix design (§5) of `2026-06-09-meter-metrics-export-fixes-design.md`, redesigned from scratch; §6 of that document (histogram OTLP) is unaffected and shipped as upstream PR #10.
 - **Delivery:** one upstream bugfix PR to `benoitc/instrument`.
 
 ---
 
-## 1. Why A1 is being replaced
+## 1. The problem on master
 
-A1 fixed the meter's two export bugs (mangled names, phantom zero) at the **render layer**: storage still held one fixed-schema vec per attribute key-set under a derived registry name, and a grouping step (`instrument_otel_streams`) re-joined them under the user-facing name on every collection.
+The meter's attributed path borrows the fixed-schema `#vector` machinery: every attribute *key-set* gets its own vec, registered under a **derived** name that bakes the label names into the metric name (`make_vec_name`, `src/instrument_meter.erl:652`), while the registered instrument itself is registered eagerly at `create_*` (`src/instrument_meter.erl:427`) and never written by the attributed path. Two export bugs follow directly:
 
-That puts recurring work on the hot paths. Per scrape, A1:
+1. **Mangled names** — attributed data exports as `<name>_<labels>` (counters/gauges) / `<name>_vec_<labels>` (histograms) families, not under the registered name;
+2. **Phantom zero** — the registered name exports a constant-zero, no-attributes series forever.
 
-1. builds a fresh name index — 2 persistent_term reads per instrument (`otel_name_index/0`), discarded after use;
-2. renames every collected entry (map lookup each);
-3. runs a grouping fold (accidentally quadratic in distinct names — `Ord ++ [N]`), per-group row appends, a `usort` label union, and a help-reconciliation scan (`first_non_empty`);
-4. in Prometheus, re-computes the label union per family and pads per row.
+The structural root: the registry holds **1 + K entries per instrument** (base + one vec per key-set), and the instrument's identity — its real name, which series belong to it, what the label union is — exists nowhere; it is implicit in derived name strings. The write path pays for this too: *every* attributed write re-sorts the attrs, **rebuilds the derived vec-name binary** (`make_vec_name` runs per write, not per first write), and does two persistent_term gets before the NIF op.
 
-Per attributed write, the pre-existing path (unchanged by A1) rebuilds the derived vec-name binary (`make_vec_name` runs on **every** write) and does two persistent_term gets before the NIF op.
+A render-layer repair was considered and rejected: a grouping pass between `collect_all/0` and the formatters could re-join the 1 + K entries under the registered name, but it must re-derive the identity answer on **every scrape** (build a name index, rename every entry, group, union) and leaves the per-write costs untouched — recurring runtime work for a fact that changes only at two rare moments: instrument creation and the first write of a new attribute set.
 
-The identity question — *which rows belong to which instrument, under what name, with what label union* — only changes at two rare moments: instrument creation and the first write of a new attribute set. A1 re-derives the answer every scrape. This design stores the answer at those two moments and makes both hot paths read-only.
+This design stores the answer at those two moments instead, and makes both hot paths read-only.
 
 ### The same instrument's storage, today vs after
 
-`requests` counter, written once with no attrs, once with `#{method, status}`, once with `#{region}`. (Storage is identical on master and the A1 branch — A1 changed the render layer, not storage; they differ only in how the base entry gets registered.)
+`requests` counter, written once with no attrs, once with `#{method, status}`, once with `#{region}`.
 
-**Today — three registry entries, two under derived names, re-joined at every scrape:**
+**Today — three registry entries, two under derived names; the export shows all three:**
 
 ```mermaid
 flowchart LR
@@ -40,26 +37,26 @@ flowchart LR
     PM0["{instrument_metric, {otel, requests}}"]
     PM1["{instrument_metric,<br/>{otel_vec, requests_method_status}}"]
     PM2["{instrument_metric,<br/>{otel_vec, requests_region}}"]
-    VL["side-table {otel_instrument_vecs, ...}<br/>[vec names] — read every scrape,<br/>leaks on registry restart"]
+    VL["side-table {otel_instrument_vecs, ...}<br/>[vec names] — kept for unregister cleanup;<br/>leaks on registry restart"]
     CV1["row cache {instrument_label,<br/>{otel_vec, requests_method_status},<br/>[GET, 200]}"]
     CV2["row cache {instrument_label,<br/>{otel_vec, requests_region}, [eu]}"]
   end
 
   subgraph RECS["three registry records — two under derived names"]
-    B["base #metric{handle = {Ref0, T0}}<br/>master: eager — the phantom 0<br/>A1: lazy-registration hack"]
+    B["base #metric{handle = {Ref0, T0}}<br/>eagerly registered at create —<br/>exports 0 forever: the phantom"]
     V1["#vector{labels = [method, status],<br/>labels_map: [GET,200] → row}"]
     V2["#vector{labels = [region],<br/>labels_map: [eu] → row}"]
   end
 
   subgraph NIFS["NIF atomics"]
-    A0["Ref0"]
-    A1n["Ref1"]
-    A2n["Ref2"]
+    Rf0["Ref0"]
+    Rf1["Ref1"]
+    Rf2["Ref2"]
   end
 
   ETS["ETS replicas:<br/>schedulers × 3 records"]
 
-  GRP["every scrape: otel_name_index/0 + group/2<br/>re-join the 3 entries under requests"]
+  OUT["the export, every scrape:<br/>requests 0 — the phantom<br/>requests_method_status — mangled<br/>requests_region — mangled"]
 
   OI -. same term .-> B
   IDX --> PM0
@@ -68,15 +65,14 @@ flowchart LR
   PM0 --> B
   PM1 --> V1
   PM2 --> V2
-  B --> A0
-  V1 --> A1n
-  V2 --> A2n
+  B --> Rf0
+  V1 --> Rf1
+  V2 --> Rf2
   CV1 --> V1
   CV2 --> V2
-  VL -.-> GRP
-  PM0 -.-> GRP
-  PM1 -.-> GRP
-  PM2 -.-> GRP
+  B -.-> OUT
+  V1 -.-> OUT
+  V2 -.-> OUT
   B -. copied .-> ETS
   V1 -. copied .-> ETS
   V2 -. copied .-> ETS
@@ -126,8 +122,8 @@ flowchart LR
 What the diff buys, structurally:
 
 - 3 registry entries (2 with derived names) → **1 entry, real name only**; nothing to rename or re-join, ever.
-- `{otel_instrument_vecs}` side-table + per-scrape `otel_name_index/0` + `group/2` → **identity stored in `#otel_rows`** (rows, union), written at creation moments.
-- The base series (eager phantom on master / lazy hack on A1) → **the `{[],[]}` row**, which exists iff it was written.
+- Identity implicit in derived name strings + the `{otel_instrument_vecs}` side-table → **identity stored in `#otel_rows`** (rows, union), written at creation moments.
+- The eagerly-registered base series (the phantom zero) → **the `{[],[]}` row**, which exists iff it was written.
 - Caller handle: a full `#metric` record → **just the name**.
 - Row cache keys: derived vec name + values → **real name + canonical attrs**, so the fast path needs one get instead of two.
 
@@ -135,9 +131,9 @@ What the diff buys, structurally:
 
 **Goals**
 
-- Same externally-visible bug fixes as A1: attributed data exports under the registered name as one stream; no phantom zero series; Prometheus renders heterogeneous key-sets as one family with unioned, empty-filled labels.
+- The two export bugs fixed: attributed data exports under the registered name as one stream; no phantom zero series. Prometheus renders heterogeneous key-sets as one family with unioned, empty-filled labels.
 - **Write fast path:** canonicalize attrs → 1 persistent_term get → 1 NIF op. Nothing else, labeled or unlabeled.
-- **Collect path:** per instrument, 1 persistent_term get + 1 NIF read per row. No index building, no renaming, no grouping, no per-scrape union computation. `instrument_otel_streams` is deleted, not optimized.
+- **Collect path:** per instrument, 1 persistent_term get + 1 NIF read per row. No name derivation, no grouping, no per-scrape union computation — the collect callback's output is final.
 - All reconciliation paid at creation moments (instrument creation; first write of a new attribute set), serialized through the existing registry gen_server pattern.
 
 **Non-goals**
@@ -215,7 +211,7 @@ flowchart LR
 
   subgraph NIF["NIF atomics"]
     A0["Ref0"]
-    A1["Ref1"]
+    N1["Ref1"]
   end
 
   ETS["ETS replicas — one table per scheduler,<br/>same record, bookkeeping only"]
@@ -229,7 +225,7 @@ flowchart LR
   C0 --> R0
   C1 --> R1
   R0 --> A0
-  R1 --> A1
+  R1 --> N1
   META -. "copied on row creation" .-> ETS
 ```
 
@@ -242,7 +238,7 @@ The row-cache entries and the record's `rows` map point at the **same** row reco
 - **`#otel_rows{}`** — the instrument container; the `handle` of the one registry record.
   - *Read:* every scrape (`collect_instrument` takes kind/help/start_time/union/rows); every slow-path write (membership re-check, `map_size(rows)` cardinality pre-check, histogram `boundaries`); unregister (cleanup walks it).
   - *Written:* once at `create_*` (kind, help, start_time, boundaries); once per new attribute set (gen_server adds the row, merges the union, re-puts the record).
-  - *Why:* the stored answer to "which rows, union, and metadata belong to this instrument" — the identity A1 re-derived every scrape. Replaces the per-key-set `#vector` records, the `{otel_instrument_vecs}` side-table, `otel_name_index/0`, and `group/2`.
+  - *Why:* the stored answer to "which rows, union, and metadata belong to this instrument" — identity that today exists only implicitly, scattered across derived name strings. Replaces the per-key-set `#vector` records and the `{otel_instrument_vecs}` side-table.
 
 - **`rows` map** (`#{Canon => row #metric{}}`, inside `#otel_rows`).
   - *Read:* every scrape (folded, one NIF read per row); slow path (does this attribute set exist?); unregister (drives cache erasure and exemplar cleanup — no external "what to clean" tracking needed).
@@ -261,7 +257,7 @@ The row-cache entries and the record's `rows` map point at the **same** row reco
 - **`union`** (sorted label-name list, inside `#otel_rows`).
   - *Read:* every scrape — emitted as the entry's `labels`; Prometheus pads each row against it.
   - *Written:* `lists:umerge` at row creation, the only moment it can change.
-  - *Why:* Prometheus requires one fixed label column set per family while OTel permits per-row key-sets; storing the union removes A1's per-scrape `usort` + re-union.
+  - *Why:* Prometheus requires one fixed label column set per family while OTel permits per-row key-sets; storing the union gives the formatter its columns with zero per-scrape set computation.
 
 - **row cache** (pt `{instrument_label, {otel, Name}, Canon} → row #metric{}`).
   - *Read:* **every write** — the fast path's single get.
@@ -307,9 +303,11 @@ do_write(RegName, Attrs, WriteFun) ->
 ```
 master, attributed:  sort attrs → build vec-name binary → pt get (vec) → pt get (row) → NIF
 B,      attributed:  sort attrs → pt get (row) → NIF
-master, unlabeled:   pt get (ensure_base_registered, A1) → NIF
+master, unlabeled:   NIF op directly on the handle in the caller's descriptor
 B,      unlabeled:   pt get (row cache, key {[],[]}) → NIF
 ```
+
+The attributed fast path sheds the per-write name-binary construction and the second persistent_term get. Unlabeled writes **gain one pt get** (today they are a direct NIF op on the handle the descriptor carries) — the price of the base series becoming an ordinary row, which is exactly what makes the phantom impossible.
 
 ```mermaid
 flowchart TD
@@ -367,11 +365,10 @@ collect_instrument(RegName) ->
 - `wire_type`: `counter | observable_counter → counter`; `up_down_counter | gauge | observable_gauge | observable_up_down_counter → gauge`; `histogram → histogram`. (Moves to the meter; `instrument_vector:wire_type/1` remains for standalone vecs.)
 - The emitted map is final: name, type, help, stored union, rows. Data-point/row order is unspecified (map iteration) — semantically irrelevant in both Prometheus and OTLP.
 
-**Formatters return to dumb:**
+**Formatter changes:**
 
-- `instrument_prometheus:format/0` and `instrument_metrics_exporter:collect_metrics/0` call `instrument_registry:collect_all()` directly; the `instrument_otel_streams:group/1` wrapper is deleted from both.
-- New skip clause in each: `data := []` emits nothing. That is the entire phantom story: a created-but-never-written instrument collects an empty row set and produces no output (matches OTel SDKs). Note the registration mechanism differs from A1 (eager entry + empty-data skip, vs A1's lazy base registration) but the observable behavior is identical: nothing exported until first write.
-- Prometheus labeled clauses read the union from the entry's `labels` key (which `instrument_vector:collect/1` also already provides) instead of recomputing; `union_labels/1` is deleted. `pad_row/3` stays for heterogeneous rows, with a fast first clause `pad_row(Union, Union, Vals) -> Vals` — the common case (single key-set; every standalone vec) pads for free.
+- New first clause in each formatter: `data := []` emits nothing. That is the entire phantom story: a created-but-never-written instrument collects an empty row set and produces no output (matches the OTel SDKs' no-data-point behavior).
+- Prometheus's labeled clauses today zip the family's fixed `labels` with every row's values (`instrument_prometheus.erl:51-52`) — correct only while all rows share the family schema, which heterogeneous key-sets break (`lists:zip/2` length mismatch). They now pad each row's own names against the entry's `labels` (the stored union) via a new `pad_row/3`, whose fast first clause `pad_row(Union, Union, Vals) -> Vals` makes the common case (single key-set; every standalone vec) free.
 - Unlabeled-only output bytes are identical to today: a `{[], [], Val}` row under an empty union renders `requests_total 42`.
 
 ```mermaid
@@ -419,17 +416,17 @@ flowchart LR
 
 Hot-path contract (the point of the design):
 
-| Path | master / A1 | this design |
+| Path | master | this design |
 |---|---|---|
 | attributed write (steady) | sort + name-binary build + 2 pt gets + NIF | sort + 1 pt get + NIF |
-| unlabeled write (steady) | 1 pt get (A1) + NIF | 1 pt get + NIF |
-| collect, per instrument | per-vec collects w/ self-re-lookup + index build (2 pt gets/instrument) + rename + group fold + usort union (+ Prometheus re-union/pad) | 1 pt get + 1 NIF read per row (+ Prometheus pad, free for single key-set) |
-| observable attributed observation | `ensure_vec_metric` every cycle | 1 pt get + NIF |
+| unlabeled write (steady) | direct NIF op on the descriptor's handle | 1 pt get + NIF (one new get — see §4) |
+| collect, per instrument | 1 + K entry collects, each vec re-looking itself up — and the output is wrong (derived names + phantom) | 1 pt get + 1 NIF read per row (+ Prometheus pad, free for single key-set) |
+| observable attributed observation | `ensure_vec_metric` every observation, every cycle | 1 pt get + NIF |
 
 Costs — all concentrated on **row creation** (none on steady writes or scrapes). Verified multipliers: ETS records are replicated per scheduler (`instrument_lib:tables/0`); cardinality limit defaults to 2000.
 
 1. **Row creation scales with the instrument's total row count** (new). Each creation rebuilds the record and copies it whole to pt **and** each scheduler's ETS table: (S+1) × O(rows). Cumulative over a ramp: quadratic in bytes (at the 2000 limit, ~100–200 KB record → ~2–3 MB copied per late creation on 16 schedulers). Master has the same quadratic per key-set vec, so this is worse by factor K (distinct key-sets, typically 1–3); the common K=1 case is byte-identical to master. Init-time only.
-2. **One global literal-GC sweep per row creation** (inherited, count unchanged). The replacing pt put makes the old record dying garbage; the literal collector walks every process in the node. Exactly one replacing put per creation — same as master's `create_vector_metric`, one fewer than A1's first-key-set path. Fresh puts (row cache) don't sweep.
+2. **One global literal-GC sweep per row creation** (inherited, count unchanged). The replacing pt put makes the old record dying garbage; the literal collector walks every process in the node. Exactly one replacing put per creation — same as master's `create_vector_metric`; master's `track_vec_metric` adds one more for each key-set after the first. Fresh puts (row cache) don't sweep.
 3. **Creation serializes through the registry gen_server** (inherited). Cold-start herds queue on one process (`gen_server:call` 5s timeout at the extreme). No new call types — one call per row, and the per-key-set vec-registration call disappears — but cost 1 makes late calls heavier near the limit.
 4. **Per-write floor** (improved, not zero): `maps:to_list` + sort + value→binary conversions (`#{status => 200}` allocates `<<"200">>` every write) + composite-key hash/compare. Strictly cheaper than master; the remaining cost is inherent to an attrs-map-per-call API. Future lever: a bound-instrument API.
 5. **Memory** (inherited shape): the record lives in S+1 full copies; rows also appear once each in the pt cache. Totals equal to master (same rows split across K records today).
@@ -441,28 +438,28 @@ Escape hatch if 1/3 ever bite: move rows into a dedicated ETS table keyed `{RegN
 
 ## 11. Behavior changes to document (CHANGELOG / PR)
 
-1. The two original fixes (same contract as A1): attributed meter data exports under the registered name as one stream; no phantom zero — instruments appear on first write.
+1. The two fixes: attributed meter data exports under the registered name as one stream; no phantom zero — instruments appear on first write.
 2. Prometheus: an instrument written with several attribute key-sets renders as one family with unioned labels, absent keys empty-filled.
 3. Cardinality limit applies **per instrument** for meter instruments (was per key-set); the overflow series is the OTel `otel.metric.overflow` attribute set (was per-vec sentinel labels).
 4. OTLP data points for attributed counters/histograms gain `start_time` (previously absent).
 
 ## 12. Deleted / added / untouched
 
-**Deleted:** `src/instrument_otel_streams.erl` + `test/instrument_otel_streams_SUITE.erl`; in `instrument_meter`: `otel_name_index/0`, `ensure_vec_metric/4`, `make_vec_name/2`, `label_suffix/1`, `track_vec_metric/2`, `unregister_associated_vec_metrics/1`, `ensure_base_registered/1`, `create_underlying_metric/3`, `create_observable_underlying/2`, `storage_type/1`, `store_observable_observation/5`, the `do_add`/`do_record`/`do_set` clause family; in `instrument_prometheus`: `union_labels/1`, the `{otel_vec,_}` `format_name` clause, the `group` call; in the exporter: the `group` call, `{otel_vec,_}` clauses; in `instrument_test`: the `{otel_vec,_}` `name_matches` clause.
+**Deleted:** in `instrument_meter`: `ensure_vec_metric/4`, `make_vec_name/2`, `label_suffix/1`, `track_vec_metric/2`, `unregister_associated_vec_metrics/1`, `unregister_underlying_metric/1`, `get_internal_metric_name/1`, `create_underlying_metric/3`, `create_observable_underlying/2`, `storage_type/1`, `store_observable_observation/5`, the `do_add`/`do_record`/`do_set` clause family; in `instrument_prometheus`: the `{otel_vec,_}` `format_name` clause; in the exporter: the `{otel_vec,_}` clauses in `get_instrument_unit/1` and `to_binary/1`; in `instrument_test`: the `{otel_vec,_}` `name_matches` clause.
 
-**Added:** `#otel_rows` (instrument.hrl); in `instrument_meter`: container construction + registration inline in `create_instrument/4` / `create_observable_instrument/4` (replacing `create_underlying_metric/3`), `do_write/3` + `slow_write/3`, `collect_instrument/1`, `read_row/2`, `wire_type/1`; in `instrument_registry`: the `{create_otel_row, RegName, Canon}` `handle_call` + `#otel_rows` clauses in `erase_cached_labels/2` and `release_exemplar_reservoirs/1`; formatter/exporter: `data := []` skips, stored-union read, `pad_row` fast clause, labeled `start_time` pass-through.
+**Added:** `#otel_rows` (instrument.hrl); in `instrument_meter`: container construction + registration inline in `create_instrument/4` / `create_observable_instrument/4` (replacing `create_underlying_metric/3`), `do_write/3` + `slow_write/3`, `collect_instrument/1`, `read_row/2`, `wire_type/1`; in `instrument_registry`: the `{create_otel_row, RegName, Canon}` `handle_call` + `#otel_rows` clauses in `erase_cached_labels/2` and `release_exemplar_reservoirs/1`; in `instrument_prometheus`: the `data := []` skip and `pad_row/3` (each row padded to the family's union labels); in the exporter: the `data := []` skip, per-row attribute names, and `start_time` on labeled counter/histogram data points.
 
 **Untouched:** `#vector`, `instrument_vector`, the standalone `instrument_metric:*_vec` API and its semantics (including per-vec cardinality for standalone vecs); `find_view_boundaries/1`; `get_instrument/1` / `list_instruments/0`; `#otel_instrument.temporality`. Net: `instrument_meter` ends smaller than on master.
 
 ## 13. Test contract
 
-- **Ported from the A1 branch** (assertions carry over nearly verbatim; they specify the externally-visible contract): single stream under the registered name; no mangled series (both `<name>_<labels>` and `<name>_vec_<labels>` shapes asserted absent); no phantom zero; Prometheus union + empty-fill; description preserved; attributed observable single-stream. The exporter suite's scalar-shape assertions adjust to the row shape (`data` + stream `start_time`).
+- **The behavioral contract, locked by new and updated suite cases:** single stream under the registered name; no mangled series (both `<name>_<labels>` and `<name>_vec_<labels>` shapes asserted absent); no phantom zero; Prometheus union + empty-fill; attributed observable single-stream; stream `start_time` on attributed OTLP data points. Existing suite cases that assert today's derived names or the scalar emit shape for meter instruments move to the registered-name / row shape.
 - **New coverage:** per-instrument cardinality + overflow row (`otel.metric.overflow`); union maintenance across key-sets; unregister erases row caches and exemplar reservoirs; concurrent first-write of the same attribute set (race through the gen_server); created-never-written instruments emit nothing in both formats.
 - **Must stay green unmodified:** `instrument_vector_SUITE`, `instrument_cardinality_SUITE` (standalone-vec semantics), `instrument_leaks_SUITE`, `instrument_race_SUITE`, `instrument_stress_SUITE`, e2e — the proof the public vec API is untouched. (If `instrument_cardinality_SUITE` turns out to cover meter-path cardinality, those cases move to the new per-instrument semantics; checked at planning time.)
 
 ## 14. Landing strategy
 
-- Fresh implementation branch from master (`be7e75e`) — the upstream PR presents one coherent design, not A1 plus a rework. The `meter-attributed-path` branch remains the test-porting source until this lands, then is dropped (its PR was never opened).
+- Implementation branch from master (`be7e75e`).
 - Independent of PR #10 (histogram OTLP): that PR changes `instrument_metrics_exporter_otlp.erl` (encode layer); this design changes `instrument_metrics_exporter.erl` (convert layer). Different files, either lands first.
 - Overlaps PR #9 (`observable-collection-context`) only in the observables corner (§8); coordinate landing order.
 - CHANGELOG: `## [Unreleased]` entries per §11.
@@ -471,13 +468,13 @@ Escape hatch if 1/3 ever bite: move rows into a dedicated ETS table keyed `{RegN
 
 ## Appendix A — use-case sequence diagrams, before vs after
 
-Conventions: *before* = master 1.1.3 storage (which the A1 branch shares; A1-only divergences are marked). Writes shown are attributed unless noted. Lanes: the calling process, `persistent_term` (pt), the registry gen_server, the per-scheduler ETS tables, NIF atomics.
+Conventions: *before* = master 1.1.3. Writes shown are attributed unless noted. Lanes: the calling process, `persistent_term` (pt), the registry gen_server, the per-scheduler ETS tables, NIF atomics.
 
 Each use case is presented as: **Before** — what happens today; **After** — what happens in this design; **Delta** — *only* what changed (`−` removed, `+` added, `→` altered, closing with the net cost change).
 
 ### A.1 Instrument creation — `create_counter/2,3`
 
-**Before:** mint the base NIF storage up front and eagerly register the base entry (master) — A1 instead defers that registration to the first unlabeled write. The caller's descriptor holds the whole base `#metric` record.
+**Before:** mint the base NIF storage up front, eagerly register the base entry, and store the whole base `#metric` record as the descriptor's handle.
 
 ```mermaid
 sequenceDiagram
@@ -487,10 +484,10 @@ sequenceDiagram
   participant E as ETS ×schedulers
   participant PT as persistent_term
   App->>N: new_gauge() — base storage minted up front
-  App->>R: register base #metric (master — A1 defers this to the first unlabeled write)
+  App->>R: register base #metric — eagerly, at create
   R->>E: insert base record
   R->>PT: put {instrument_metric, {otel,Name}} + name into index
-  Note over R,PT: master — the base now exports 0 forever: the phantom
+  Note over R,PT: the base now exports 0 forever — the phantom
   App->>PT: put {otel_instrument, Name} descriptor (handle = the base record)
 ```
 
@@ -513,7 +510,7 @@ sequenceDiagram
 **Delta:**
 
 - − NIF allocation at create — storage is now minted per row, at first write
-- − the eagerly-registered base series (master's phantom zero) and − A1's lazy-registration hack — there is nothing to suppress
+- − the eagerly-registered base series — the phantom zero becomes impossible, not suppressed
 - \+ `#otel_rows` container (kind, help, start_time, boundaries) built once and registered under the real name
 - → descriptor `handle`: full base `#metric` record → `{otel, Name}`
 - net: one registration call either way; creation does strictly less work, and a never-written instrument emits nothing by construction
@@ -532,7 +529,7 @@ sequenceDiagram
   W->>PT: get {instrument_metric, VecName} — does the vec exist?
   W->>PT: get {instrument_label, VecName, Values} — the row
   W->>N: one NIF op
-  Note over W,N: unlabeled write — pt get (ensure_base_registered, A1) + NIF on the handle held in the descriptor
+  Note over W,N: unlabeled write — a NIF op directly on the handle held in the descriptor (no pt get)
 ```
 
 **After:** every write canonicalizes and resolves its row in one pt get, then the NIF op — the same path whether attributes are present or not.
@@ -552,9 +549,9 @@ sequenceDiagram
 
 - − `make_vec_name` derived-name binary built on every write
 - − 1 pt get (the vec-existence check)
-- − the separate unlabeled write path (and A1's `ensure_base_registered` get with it)
+- − the separate unlabeled write path — unified with attributed writes; unlabeled writes now cost one pt get they did not pay before (the base series became an ordinary row)
 - → row-cache key: `{derived vec name, values}` → `{real name, Canon}`
-- net per write: sort + binary build + 2 pt gets + NIF → sort + 1 pt get + NIF
+- net, attributed: sort + binary build + 2 pt gets + NIF → sort + 1 pt get + NIF; unlabeled: NIF → 1 pt get + NIF
 
 ### A.3 Write, first of a new attribute set — the paid "init moment"
 
@@ -616,7 +613,7 @@ sequenceDiagram
 
 ### A.4 Collection — every scrape / export tick
 
-**Before (A1):** collect every registry entry separately — the base and each vec, every vec re-looking itself up — then rebuild the name index from the descriptors and side-tables, rename every entry, group, union, and (Prometheus) re-union + pad.
+**Before:** collect every registry entry separately — the base and each of the K vecs, every vec re-looking itself up — and emit 1 + K families per instrument: derived names for the vecs, a constant zero for the base.
 
 ```mermaid
 sequenceDiagram
@@ -629,13 +626,7 @@ sequenceDiagram
     X->>PT: vector collect re-looks itself up
     X->>N: read each row
   end
-  X->>PT: get otel_instruments
-  loop per instrument — rebuild the name index
-    X->>PT: get {otel_instrument, Name}
-    X->>PT: get {otel_instrument_vecs, Base}
-  end
-  X->>X: rename every entry, group fold, usort unions, help scan
-  X->>X: prometheus — re-union + pad per row
+  X->>X: emit N+K families — derived vec names + the phantom zero base
 ```
 
 **After:** collect N entries; each reads its own record once and NIF-reads its rows; the formatters consume the stored union and skip empty instruments.
@@ -658,12 +649,11 @@ sequenceDiagram
 **Delta:**
 
 - − K extra per-entry collects and the per-vec self-re-lookup
-- − the name-index rebuild: 2 pt gets per instrument, every scrape, discarded after use
-- − the rename pass, the grouping fold, the per-scrape `usort` unions, the `first_non_empty` help scan
-- − Prometheus per-family union recompute (`union_labels/1`; it reads the entry's stored `labels` instead)
-- \+ `data == []` skip clauses in both formatters (the phantom-suppression mechanism, moved to format time)
+- − the derived-name families and the phantom zero series — the output becomes correct (this is the bug fix)
+- \+ `data == []` skip clauses in both formatters (created-but-never-written instruments emit nothing)
+- \+ per-row label padding in Prometheus — heterogeneous key-sets render as one family with union columns, empty-filled
 - \+ stream `start_time` on attributed OTLP data points (dropped entirely today)
-- net per scrape: N+K collects + index build + grouping → N lookups + the irreducible per-row NIF reads
+- net per scrape: N+K entry collects → N lookups + the irreducible per-row NIF reads
 
 ### A.5 Observable cycle — runs inside every export tick
 
@@ -682,7 +672,7 @@ sequenceDiagram
     X->>PT: vec get + row get — 2 gets
     X->>N: set
   end
-  Note over X,N: then the A1 collection sequence (A.4 before)
+  Note over X,N: then the collection sequence (A.4 before)
 ```
 
 **After:** each observation is a standard fast-path write.
