@@ -244,6 +244,16 @@ note_cardinality_dropped(Name) ->
   ok.
 ```
 
+Widen the label-cache specs (`src/instrument_registry.erl:306-310`) — the third key element is now either a values list (standalone vecs) or a `{Names, Values}` canon tuple (meter rows); the functions already store arbitrary terms, only the specs are narrower, and `rebar3 dialyzer` (CI) would flag the tuple calls as contract violations:
+
+```erlang
+-spec lookup_label(term(), term()) -> #metric{} | undefined.
+```
+
+```erlang
+-spec cache_label(term(), term(), #metric{}) -> ok.
+```
+
 Add the handle_call clause after the `{create_vector_metric, Name, Label}` clause (`src/instrument_registry.erl:143-151`):
 
 ```erlang

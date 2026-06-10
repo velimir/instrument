@@ -264,10 +264,10 @@ The row-cache entries and the record's `rows` map point at the **same** row reco
   - *Written:* once per row at creation (a fresh put — no literal-GC sweep); erased at unregister, driven by the rows map.
   - *Why:* resolves attrs → row in one lock-free get without touching the potentially large parent record on the hot path. Reuses today's `instrument_label` prefix, so the registry's existing unregister/restart sweeps already cover it.
 
-- **overflow sentinel** (pt `{instrument_label_overflow, {otel, Name}} → overflow row`).
+- **overflow row cache entry** (pt `{instrument_label, {otel, Name}, {[<<"otel.metric.overflow">>], [<<"true">>]}} → overflow row`) — an ordinary row-cache entry under the overflow canon, not a separate key.
   - *Read:* slow-path writes once the instrument is at the cardinality limit.
-  - *Written:* once, via the gen_server, on first overflow.
-  - *Why:* overflow happens exactly when write volume is high, so overflowed writes must stay off the gen_server; the row itself is the OTel-spec `otel.metric.overflow` series.
+  - *Written:* once, via the gen_server, when the overflow row is first created.
+  - *Why:* overflow happens exactly when write volume is high, so overflowed writes must stay off the gen_server; the row itself is the OTel-spec `otel.metric.overflow` series. Reusing the ordinary cache key means one less concept and the rows map stays the single cleanup manifest.
 
 **Pre-existing, kept — their role here**
 
@@ -318,7 +318,7 @@ flowchart TD
   PAR --> EX{"Canon already in rows?"}
   EX -->|"yes — cache raced"| RC["cache_label"] --> NIF
   EX -->|no| CARD{"map_size(rows) >= limit?"}
-  CARD -->|yes| OVF["overflow row<br/>(pt-cached sentinel)"] --> NIF
+  CARD -->|yes| OVF["overflow row<br/>(its own pt row-cache entry)"] --> NIF
   CARD -->|no| GS["gen_server: create_otel_row<br/>(serialized; re-checks existence + limit)"]
   GS --> MINT["mint row storage by kind<br/>counter: {Ref, now} - gauge: Ref - histogram: container boundaries"]
   MINT --> UPD["rows + Canon, union merge Names<br/>do_reg_metric: ETS x schedulers + replacing pt put<br/>cache_label: fresh pt put"]
@@ -394,7 +394,7 @@ flowchart LR
 
 - The limit check moves to the slow path only (existing rows are always writable, as today) and becomes `map_size(rows) >= instrument_config:get_metric_cardinality_limit()` — exact, no ETS read.
 - **Per instrument**, as the OTel spec defines it. Today it is per key-set vec: one instrument writing K key-sets can hold K× the configured limit. Behavior change, documented (§11).
-- The overflow series is the spec's overflow attribute set — one ordinary row keyed `{[<<"otel.metric.overflow">>], [<<"true">>]}` — replacing today's per-vec sentinel-filled label sets. It joins the union and collects like any row. Its handle is cached at `{instrument_label_overflow, RegName}` (existing prefix, already covered by unregister and restart cleanup), so sustained overflow stays fast: parent pt get (pre-check) + sentinel pt get + NIF — the gen_server is involved only when the overflow row is first created (as with `get_or_create_overflow/1` today). The `{dropped, RegName}` ETS counter keeps feeding `cardinality_dropped/1`; `cache_label`'s `{count, RegName}` accounting keeps `label_count/1` reporting.
+- The overflow series is the spec's overflow attribute set — one ordinary row keyed `{[<<"otel.metric.overflow">>], [<<"true">>]}` — replacing today's per-vec sentinel-filled label sets. It joins the union, collects like any row, and is cached under its own ordinary row-cache key (no separate sentinel key — the rows map stays the single cleanup manifest, and unregister/restart sweeps already cover the `instrument_label` prefix). Sustained overflow stays off the gen_server: each dropped write costs the row-cache miss + the parent pt get (membership + O(1) `map_size` limit check) + the overflow row's cache get + NIF; the gen_server is involved only when the overflow row is first created. The `{dropped, RegName}` ETS counter keeps feeding `cardinality_dropped/1`; the row-cache accounting keeps `label_count/1` reporting.
 
 ## 8. Observables
 
@@ -408,7 +408,7 @@ flowchart LR
 - `instrument_registry:do_unreg_metric/1` already drives cleanup from the record being removed. Its two helpers gain `#otel_rows` clauses:
   - `erase_cached_labels/2`: walk `rows`, erase each `{instrument_label, RegName, Canon}`;
   - `release_exemplar_reservoirs/1`: walk `rows`, `instrument_histogram:cleanup(Row)` per row.
-  (`{instrument_label_overflow, RegName}` is already erased for every metric.)
+  (The meter no longer writes any `{instrument_label_overflow, _}` key; `do_unreg_metric`'s unconditional erase of it stays as-is for standalone vecs.)
 - `instrument_meter:unregister_instrument/1` shrinks to: `instrument_metric:unregister({otel, Name})` + erase the `{otel_instrument, Name}` descriptor + names-list update. `unregister_associated_vec_metrics/1` is deleted.
 - Registry restart (`clear_instrument_persistent_terms/0`) already sweeps every pt prefix this design uses. Bonus fix: today's `{otel_instrument_vecs, Base}` entries are **not** in `is_instrument_key/1`'s prefix list and leak across registry restarts; the key ceases to exist.
 
