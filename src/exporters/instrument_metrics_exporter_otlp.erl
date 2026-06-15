@@ -36,7 +36,7 @@
 -author("benoitc").
 
 %% Public API
--export([new/1]).
+-export([new/1, encode_metrics/1]).
 
 %% Exporter callbacks
 -export([exporter_init/1, exporter_export/2, exporter_shutdown/1]).
@@ -235,10 +235,12 @@ encode_histogram_data_point(#{attributes := Attrs, value := Value, timestamp := 
   #{count := Count, sum := Sum, buckets := Buckets} = Value,
   %% OTLP bucketCounts must be one longer than explicitBounds (includes +Inf bucket)
   %% Get individual bucket counts (not cumulative)
-  BucketCounts = [maps:get(count, B, 0) || B <- Buckets],
+  %% Buckets carry cumulative counts in ascending bound order; OTLP wants
+  %% per-bucket counts, so take the difference from the previous bound.
+  BucketCounts = decumulative_counts(Buckets),
   %% ExplicitBounds excludes +Inf
-  ExplicitBounds = [maps:get(upper_bound, B) || B <- Buckets,
-                    maps:get(upper_bound, B) =/= infinity],
+  ExplicitBounds = [maps:get(bound, B) || B <- Buckets,
+                    maps:get(bound, B) =/= infinity],
   Exemplars = maps:get(exemplars, Value, []),
   Base = #{
     <<"attributes">> => encode_attributes(Attrs),
@@ -254,6 +256,17 @@ encode_histogram_data_point(#{attributes := Attrs, value := Value, timestamp := 
     undefined -> Base;
     StartTime -> Base#{<<"startTimeUnixNano">> => integer_to_binary(StartTime)}
   end.
+
+%% Convert cumulative bucket counts to per-bucket counts. Buckets are in
+%% ascending bound order with the +Inf bucket last; each `count' is the
+%% cumulative count up to and including that bound.
+decumulative_counts(Buckets) ->
+  {Counts, _Last} =
+    lists:mapfoldl(fun(B, Prev) ->
+      Cum = maps:get(count, B, 0),
+      {Cum - Prev, Cum}
+    end, 0, Buckets),
+  Counts.
 
 %% Encode count as string (OTLP uses fixed64/string for counts)
 encode_uint64(V) when is_integer(V) -> integer_to_binary(V);

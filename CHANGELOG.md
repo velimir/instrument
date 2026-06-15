@@ -73,6 +73,13 @@ All notable changes to this project will be documented in this file.
   API) rather than the arbitrary iteration order of the map.
 - Collectorless registered records (those registered via `instrument_registry:
   register/1` without a `collect` MFA) no longer crash `collect_all/0`.
+- OTLP metrics: a histogram no longer raises `{badkey, upper_bound}` during
+  encoding. Previously any histogram present caused the encoder to crash and,
+  because the whole batch is encoded under one `catch`, silently dropped every
+  metric in that export (counters and gauges included).
+- OTLP histogram `bucketCounts` are now per-bucket counts as the OTLP spec
+  requires, instead of the cumulative counts stored internally (which made
+  every bucket over-count on spec-compliant backends).
 
 ### Removed
 - Per-scheduler registry replica ETS tables (`instrument_registry_1..N`) and
