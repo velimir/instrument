@@ -8,6 +8,14 @@ All notable changes to this project will be documented in this file.
 - In-place upgrade from 1.1.x self-cleans legacy `persistent_term` shapes
   (`instrument_metrics`, `otel_instrument_vecs`, `instrument_label_overflow`,
   `otel_instruments`) on the first registry (re)start.
+- Observable instrument callbacks can now take arity 2:
+  `fun(Observe, Ctx)`. `Ctx` is a plain map seeded empty at the start of
+  each `instrument_meter:collect_observables/0` cycle and threaded through
+  the callbacks; the callback's returned map is merged into it (callback
+  entries win). Callbacks that derive several metrics from one expensive
+  source (e.g. a single heavy RPC) can store the fetched payload under an
+  agreed key and reuse it within the cycle instead of fetching once per
+  instrument. Arity-0 and arity-1 callbacks are unchanged.
 
 ### Changed
 - Attributed meter data now exports under the registered instrument name as
