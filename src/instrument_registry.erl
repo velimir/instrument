@@ -106,6 +106,7 @@ clear_labels(Name) ->
 
 init([]) ->
   _ = create_label_counts_table(),
+  ok = instrument_exemplar:init_table(),
   %% A registry restart is a clean slate: erase any stale instrument-owned
   %% persistent_term entries left by a previous incarnation so get_instrument/1
   %% returns undefined and create_* re-registers. instrument_series:init/0
